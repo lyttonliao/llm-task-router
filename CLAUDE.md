@@ -29,9 +29,9 @@ llm_task_router/
   providers/
     base.py       - Provider protocol (invoke(prompt, model) -> ProviderResult)
     claude_cli.py - subprocess wrapper around `claude -p`
-    codex_cli.py  - subprocess wrapper around `codex exec` (command shape
-                    confirmed against a real install - see rough edges below
-                    for what's still unverified)
+    codex_cli.py  - subprocess wrapper around `codex exec`, verified end to
+                    end against a real install and a real authenticated call
+                    (see rough edges below for what's still unverified)
   classifier.py   - tier-1 heuristic rule table (type x domain grid)
   tiers.py        - tier name -> concrete (provider, model) mapping
   router.py       - route() classifies + resolves a tier; route_and_run()
@@ -68,22 +68,26 @@ don't restructure `route()`'s shape to do this, extend it.
 
 ## Known rough edges
 
-- `providers/codex_cli.py`'s command shape (flags, `--output-last-message`
-  for getting the final text) is confirmed against a real `codex-cli 0.145.0`
-  install, but two things remain unverified because `codex doctor` shows no
-  auth configured on this machine - no authenticated call has actually been
-  made: (1) `cost_usd`/`duration_ms` are hardcoded 0.0/0 placeholders, since
-  `codex exec --help` doesn't document a cost/usage field the way claude's
-  `total_cost_usd` is documented; (2) `--output-last-message`'s behavior on
-  an error/refusal (empty file vs. partial text) is unconfirmed. Re-verify
-  with a real call after `codex login`. It's currently unreachable in
-  practice anyway since no tier in `tiers.py` routes to it yet.
+- `providers/codex_cli.py` is verified against a real `codex-cli 0.145.0`
+  install and a real authenticated (ChatGPT-account) call - not a placeholder
+  anymore. Two things still open: (1) there's no dollar-cost field anywhere
+  in `codex exec`'s output (a real run's stderr does print an unstructured
+  "tokens used" line followed by a token count, but no dollar figure, and
+  converting tokens to cost needs per-model pricing this CLI doesn't expose),
+  so `cost_usd`/`duration_ms` stay 0.0/0 placeholders; (2) `--output-last-message`'s
+  behavior on a genuine
+  content refusal (as opposed to a hard API error, which is covered) is
+  unconfirmed. It's currently unreachable through the router in practice
+  anyway since no tier in `tiers.py` routes to it yet.
 - Codex has no flag equivalent to claude_cli.py's `--disallowed-tools "*"`
-  that fully disables tool/shell use - `--sandbox read-only --ask-for-approval
-  never` is the closest analog (can't write files, never blocks on a human),
-  but the model can still choose to run read-only shell commands to gather
-  context before answering. Don't assume cost/latency parity between the two
-  provider adapters even once codex_cli.py is fully verified.
+  that fully disables tool/shell use - `--sandbox read-only` is the closest
+  analog (can't write files), but the model can still choose to run
+  read-only shell commands to gather context before answering. Don't assume
+  cost/latency parity between the two provider adapters. Also: which model
+  names are valid depends on the auth mode - a ChatGPT-account login rejects
+  some names outright (confirmed via a real 400 invalid_request_error), so
+  don't hardcode a guessed model name into `tiers.py` without checking it
+  against the account that will actually run it.
 - `tiers.TIER_MODELS` only has Claude entries, all guessed at (haiku/sonnet/
   opus for cheap/mid/flagship) rather than derived from benchmark data. Don't
   treat these as validated quality-floor tiers yet.

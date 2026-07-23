@@ -2,8 +2,8 @@
 mode - the ChatGPT-subscription equivalent of `claude -p` (ie no separately
 billed API key).
 
-Command shape confirmed against a real install (`codex-cli 0.145.0`, `codex
-exec --help`) on 2026-07-22 - not a guess anymore:
+Verified end to end against a real install and a real authenticated call
+(`codex-cli 0.145.0`, ChatGPT-account login) on 2026-07-22:
   - `--json` on `codex exec` is NOT a single result payload like claude's
     `--output-format json`. It streams one JSON *event* per line (JSONL) -
     a very different shape from claude_cli.py's single `json.loads(stdout)`.
@@ -12,27 +12,34 @@ exec --help`) on 2026-07-22 - not a guess anymore:
     JSONL event stream, so that's what this uses instead of `--json`.
   - `--skip-git-repo-check` matters because `codex exec` otherwise expects
     to run inside a git repo - this router has no reason to require that.
-  - `--sandbox read-only --ask-for-approval never` is the closest analog to
-    claude_cli.py's `--disallowed-tools "*"`, but it is NOT equivalent:
-    Codex has no flag that fully disables tool/shell use the way Claude
-    Code's does. read-only + never-ask means it can't write files and won't
-    block waiting for a human, but the model can still choose to run
-    read-only shell commands (ls, cat, rg, ...) to gather context before
-    answering - so a "simple" prompt can still cost more turns than the
-    single-shot completion claude_cli.py makes. Don't assume cost parity
-    between the two adapters.
+  - `--ask-for-approval` is a top-level `codex` option, NOT a valid `codex
+    exec` flag - passing it fails with "unexpected argument". `codex exec`
+    is non-interactive by construction and its session banner confirms it
+    auto-defaults to `approval: never`, so nothing needs to be passed for
+    this; only `--sandbox read-only` is needed as the closest analog to
+    claude_cli.py's `--disallowed-tools "*"`. Still NOT equivalent: Codex
+    has no flag that fully disables tool/shell use the way Claude Code's
+    does - the model can still choose to run read-only shell commands (ls,
+    cat, rg, ...) to gather context before answering, so a "simple" prompt
+    can still cost more turns than claude_cli.py's single-shot completion.
+    Don't assume cost/latency parity between the two adapters.
+  - Which model names are valid depends on the auth mode: a ChatGPT-account
+    login (used here) rejects some model names outright (confirmed: got a
+    400 invalid_request_error for a guessed name that doesn't exist on this
+    account's plan) - the default model when `--model` is omitted (seen in
+    a real run here: `gpt-5.6-terra`) is a safer bet than guessing until
+    tiers.py has real per-model quality-floor data to justify hardcoding one.
 
-Still NOT verified - `codex doctor` shows no auth configured on this
-machine, so no real authenticated call has been made against this code:
-  - cost_usd/duration_ms below are hardcoded to 0.0/0 placeholders. Nothing
-    in `codex exec --help` documents a per-call cost/usage field the way
-    claude's `total_cost_usd`/`duration_ms` are documented - finding the
-    real source (likely inside the `--json` event stream, if it exists at
-    all) needs either a logged-in test run or reading Codex's own docs.
-  - Whether `--output-last-message` behaves correctly on an error/refusal
-    (empty file? partial text?) is unconfirmed.
-Run `codex login` and re-verify with a real call before trusting this in
-the router for anything but a --dry-run.
+Still NOT verified:
+  - There's no dollar-cost field anywhere in `codex exec`'s output. A real
+    run's stderr banner does print a plain-text "tokens used\n<N>" line, but
+    it's unstructured (not in `--output-last-message`'s file, not JSON) and
+    converting token count to a dollar cost still needs per-model pricing
+    this CLI doesn't expose - cost_usd/duration_ms stay 0.0/0 placeholders.
+    Parsing that stderr line is possible but fragile; not done here.
+  - Behavior on an actual model error/refusal (partial file vs. empty vs.
+    non-zero exit) is covered for the "invalid model name" case seen above
+    (non-zero exit, no file), but not for a genuine content refusal.
 """
 
 import subprocess
@@ -54,15 +61,15 @@ def invoke(prompt: str, model: str) -> ProviderResult:
         model,
         "--sandbox",
         "read-only",
-        "--ask-for-approval",
-        "never",
         "--skip-git-repo-check",
         "--output-last-message",
         str(last_message_path),
     ]
     try:
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL
+            )
         except subprocess.TimeoutExpired:
             return ProviderResult(text="", cost_usd=0.0, duration_ms=60_000, error="timeout")
 
