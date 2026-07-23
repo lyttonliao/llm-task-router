@@ -58,13 +58,26 @@ don't restructure `route()`'s shape to do this, extend it.
 
 ## Adding a provider
 
+See the `add-provider` skill in this repo for the full real-verification
+workflow (install, read the actual subcommand's `--help`, check auth, write
+the adapter + mocked tests, one real authenticated call, register it). Short
+version:
+
 1. Add `llm_task_router/providers/<name>.py` with an `invoke(prompt, model)
    -> ProviderResult` function, following `claude_cli.py`'s shape.
-2. Register it in `router.PROVIDERS`.
+2. Register it in `router.PROVIDERS` as a **module**, not a pre-grabbed
+   function - `PROVIDERS = {"name": module}` then `.invoke(...)` at call
+   time, not `{"name": module.invoke}`. The latter early-binds the reference
+   at import time and silently defeats `patch("...module.invoke")` in tests -
+   this already happened once during `router.py`'s own first draft.
 3. Only add entries to `tiers.TIER_MODELS` pointing at it once you have real
-   quality-floor calibration data for that provider's models (the same kind
-   of benchmark `llm-eval-harness` runs for Claude models) - a tier mapping is
-   only as good as the quality floor behind it.
+   quality-floor calibration data for that provider's models - run
+   `llm-eval-harness`'s `calibrate-tier` skill (sibling repo, `../llm-eval-harness`)
+   to get it. A tier mapping is only as good as the quality floor behind it.
+   A first real Codex data point already exists there (`codex/gpt-5.6-terra`
+   on `bug_triage`/`v1_naive`: 66.7% severity accuracy, 86.7% category
+   accuracy, rule-based only - judge pass not run yet) but hasn't been turned
+   into a `TIER_MODELS` entry here.
 
 ## Known rough edges
 
@@ -75,9 +88,8 @@ don't restructure `route()`'s shape to do this, extend it.
   "tokens used" line followed by a token count, but no dollar figure, and
   converting tokens to cost needs per-model pricing this CLI doesn't expose),
   so `cost_usd`/`duration_ms` stay 0.0/0 placeholders; (2) `--output-last-message`'s
-  behavior on a genuine
-  content refusal (as opposed to a hard API error, which is covered) is
-  unconfirmed. It's currently unreachable through the router in practice
+  behavior on a genuine content refusal (as opposed to a hard API error,
+  which is covered) is unconfirmed. It's currently unreachable through the router in practice
   anyway since no tier in `tiers.py` routes to it yet.
 - Codex has no flag equivalent to claude_cli.py's `--disallowed-tools "*"`
   that fully disables tool/shell use - `--sandbox read-only` is the closest
