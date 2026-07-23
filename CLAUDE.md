@@ -29,8 +29,9 @@ llm_task_router/
   providers/
     base.py       - Provider protocol (invoke(prompt, model) -> ProviderResult)
     claude_cli.py - subprocess wrapper around `claude -p`
-    codex_cli.py  - subprocess wrapper around `codex exec` (UNVERIFIED - see
-                    rough edges below)
+    codex_cli.py  - subprocess wrapper around `codex exec` (command shape
+                    confirmed against a real install - see rough edges below
+                    for what's still unverified)
   classifier.py   - tier-1 heuristic rule table (type x domain grid)
   tiers.py        - tier name -> concrete (provider, model) mapping
   router.py       - route() classifies + resolves a tier; route_and_run()
@@ -67,11 +68,22 @@ don't restructure `route()`'s shape to do this, extend it.
 
 ## Known rough edges
 
-- `providers/codex_cli.py` is a best-guess placeholder. `codex` isn't
-  installed on the machine this was scaffolded on, so its command flags and
-  JSON output schema are unverified - confirm against `codex exec --help` and
-  a real run before trusting it. It's currently unreachable in practice since
-  no tier in `tiers.py` routes to it yet.
+- `providers/codex_cli.py`'s command shape (flags, `--output-last-message`
+  for getting the final text) is confirmed against a real `codex-cli 0.145.0`
+  install, but two things remain unverified because `codex doctor` shows no
+  auth configured on this machine - no authenticated call has actually been
+  made: (1) `cost_usd`/`duration_ms` are hardcoded 0.0/0 placeholders, since
+  `codex exec --help` doesn't document a cost/usage field the way claude's
+  `total_cost_usd` is documented; (2) `--output-last-message`'s behavior on
+  an error/refusal (empty file vs. partial text) is unconfirmed. Re-verify
+  with a real call after `codex login`. It's currently unreachable in
+  practice anyway since no tier in `tiers.py` routes to it yet.
+- Codex has no flag equivalent to claude_cli.py's `--disallowed-tools "*"`
+  that fully disables tool/shell use - `--sandbox read-only --ask-for-approval
+  never` is the closest analog (can't write files, never blocks on a human),
+  but the model can still choose to run read-only shell commands to gather
+  context before answering. Don't assume cost/latency parity between the two
+  provider adapters even once codex_cli.py is fully verified.
 - `tiers.TIER_MODELS` only has Claude entries, all guessed at (haiku/sonnet/
   opus for cheap/mid/flagship) rather than derived from benchmark data. Don't
   treat these as validated quality-floor tiers yet.
