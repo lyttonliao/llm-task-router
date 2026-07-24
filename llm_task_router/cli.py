@@ -4,7 +4,7 @@ from llm_task_router.router import route, route_and_run
 from llm_task_router.schema import DOMAINS, TASK_TYPES, TaskRequest
 
 
-def run_route(description: str, task_type: str, domain: str, dry_run: bool) -> None:
+def run_route(description: str, task_type: str | None, domain: str | None, dry_run: bool) -> None:
     request = TaskRequest(description=description, task_type=task_type, domain=domain)
 
     if dry_run:
@@ -30,8 +30,8 @@ def main() -> None:
 
     p_route = sub.add_parser("route", help="classify and route a task description to a model")
     p_route.add_argument("description", help="the task to run")
-    p_route.add_argument("--type", dest="task_type", required=True, choices=TASK_TYPES)
-    p_route.add_argument("--domain", default="other", choices=DOMAINS)
+    p_route.add_argument("--type", dest="task_type", choices=TASK_TYPES, help="override inferred task type")
+    p_route.add_argument("--domain", choices=DOMAINS, help="override inferred domain")
     p_route.add_argument("--dry-run", action="store_true", help="print the routing decision without calling a model")
 
     args = parser.parse_args()

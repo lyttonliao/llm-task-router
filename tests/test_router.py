@@ -22,6 +22,15 @@ def test_route_escalates_architecture_to_flagship():
     assert decision.model == "opus"
 
 
+def test_route_infers_metadata_when_caller_omits_it():
+    decision = route(TaskRequest(description="Summarize the React release notes"))
+
+    assert decision.tier == "cheap"
+    assert decision.model == "haiku"
+    assert "summarization x frontend" in decision.reason
+    assert "type inferred" in decision.reason
+
+
 def test_route_and_run_invokes_resolved_provider():
     request = TaskRequest(description="summarize this report", task_type="summarization", domain="other")
     fake_result = ProviderResult(text="summary here", cost_usd=0.001, duration_ms=200)

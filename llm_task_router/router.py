@@ -10,7 +10,7 @@ the next cascade tier means giving classify() a confidence signal and falling
 through to it here, not replacing this function's shape.
 """
 
-from llm_task_router.classifier import classify
+from llm_task_router.classifier import classify, classify_description
 from llm_task_router.providers import claude_cli, codex_cli
 from llm_task_router.schema import ProviderResult, RouteDecision, TaskRequest
 from llm_task_router.tiers import TIER_BIAS, TIER_MODELS
@@ -22,14 +22,18 @@ PROVIDERS = {
 
 
 def route(request: TaskRequest) -> RouteDecision:
-    bias = classify(request.task_type, request.domain)
+    classification = classify_description(request.description, request.task_type, request.domain)
+    bias = classify(classification.task_type, classification.domain)
     tier = TIER_BIAS[bias]
     provider, model = TIER_MODELS[tier]
     return RouteDecision(
         tier=tier,
         provider=provider,
         model=model,
-        reason=f"heuristic grid: {request.task_type} x {request.domain} -> {bias}",
+        reason=(
+            f"heuristic grid: {classification.task_type} x {classification.domain} -> {bias} "
+            f"(type {classification.task_type_source}, domain {classification.domain_source})"
+        ),
     )
 
 
