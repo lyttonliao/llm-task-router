@@ -74,10 +74,14 @@ version:
    quality-floor calibration data for that provider's models - run
    `llm-eval-harness`'s `calibrate-tier` skill (sibling repo, `../llm-eval-harness`)
    to get it. A tier mapping is only as good as the quality floor behind it.
-   A first real Codex data point already exists there (`codex/gpt-5.6-terra`
-   on `bug_triage`/`v1_naive`: 66.7% severity accuracy, 86.7% category
-   accuracy, rule-based only - judge pass not run yet) but hasn't been turned
-   into a `TIER_MODELS` entry here.
+   As of 2026-07-23 that repo has full judged data for every Codex model this
+   account can reach (`gpt-5.4-mini`, `gpt-5.6-luna`, `gpt-5.6-terra`,
+   `gpt-5.5`) against Claude's haiku/sonnet/opus on `bug_triage`/`v1_naive`
+   (see its CLAUDE.md, "Router tier calibration status") - and the verdict is
+   **none of them clear haiku's cheap-tier floor yet**. Don't add a Codex
+   entry to `TIER_MODELS` off that data; re-run calibration if a stronger
+   Codex model becomes accessible on this account (`gpt-5.6-sol` and several
+   others 400 on the current login - see that section for the full list).
 
 ## Known rough edges
 
@@ -99,10 +103,20 @@ version:
   names are valid depends on the auth mode - a ChatGPT-account login rejects
   some names outright (confirmed via a real 400 invalid_request_error), so
   don't hardcode a guessed model name into `tiers.py` without checking it
-  against the account that will actually run it.
-- `tiers.TIER_MODELS` only has Claude entries, all guessed at (haiku/sonnet/
-  opus for cheap/mid/flagship) rather than derived from benchmark data. Don't
-  treat these as validated quality-floor tiers yet.
+  against the account that will actually run it. As of 2026-07-23, on the
+  account used for development: `gpt-5.4-mini`, `gpt-5.6-luna`,
+  `gpt-5.6-terra`, and `gpt-5.5` are reachable; `gpt-5.6-sol`, `gpt-5.3-codex`,
+  `gpt-5.1-codex-mini`, `gpt-5.4-nano`, `gpt-5.4`, and `gpt-5.2` all 400. A
+  different account/plan may differ - re-probe with a single cheap `codex
+  exec` call before trusting either list.
+- `tiers.TIER_MODELS`'s Claude entries (haiku/sonnet/opus for cheap/mid/
+  flagship) are now backed by real judged benchmark data, not a guess - as of
+  2026-07-23 `llm-eval-harness` confirmed a clean, monotonic ladder on
+  `bug_triage`/`v1_naive` (haiku 60% fully-correct → sonnet 66.7% → opus
+  73.3%, judge coherence flat ~0.84-0.85 across all three). No Codex model
+  tested clears haiku's floor yet, so the map stays Claude-only for now - see
+  the calibration status section in that repo's CLAUDE.md for the full table
+  and which Codex model slugs are even reachable on this account.
 - Whether task types like `code_gen`/`refactor` should eventually get real
   tool access (vs. the current single-shot, tools-disabled completion every
   provider call makes) is an open, deliberately deferred question - see the
