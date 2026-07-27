@@ -36,7 +36,10 @@ llm_task_router/
   tiers.py        - tier name -> concrete (provider, model) mapping
   router.py       - route() classifies + resolves a tier; route_and_run()
                     also invokes the provider
-  cli.py          - `python -m llm_task_router route <description> --type ... --domain ...`
+  cli.py          - `llm-route route <description> --type ... --domain ...`
+                    (installed console script; `python -m llm_task_router
+                    route ...` still works identically, cli.py is unchanged
+                    either way - see "Installed CLI entrypoint" below)
 ```
 
 ## The classifier is a three-tier cascade; only tier 1 exists
@@ -85,6 +88,19 @@ version:
    entry to `TIER_MODELS` off that data; re-run calibration if a stronger
    Codex model becomes accessible on this account (`gpt-5.6-sol` and several
    others 400 on the current login - see that section for the full list).
+
+## Installed CLI entrypoint
+
+`pyproject.toml` declares `[project.scripts] llm-route = "llm_task_router.cli:main"`
+and `[tool.uv] package = true`-equivalent build config (`[build-system]` +
+`[tool.uv.build-backend] module-root = ""`, needed because the package lives
+at the repo root, not under `src/`). `uv sync` builds and installs it, after
+which `uv run llm-route route "<description>" --dry-run` works as a real
+command, not just `python -m llm_task_router`. `cli.py`'s `main()` didn't
+change shape - only `ArgumentParser(prog=...)` was updated from the old
+`"python -m llm_task_router"` to `"llm-route"` so `--help` output matches the
+way it's actually invoked now. Both invocation styles keep working
+side by side; there's no reason to remove the `-m` path.
 
 ## Auth pre-flight check
 

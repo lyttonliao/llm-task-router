@@ -25,7 +25,7 @@ def run_route(description: str, task_type: str | None, domain: str | None, dry_r
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(prog="python -m llm_task_router")
+    parser = argparse.ArgumentParser(prog="llm-route")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_route = sub.add_parser("route", help="classify and route a task description to a model")
