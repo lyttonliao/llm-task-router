@@ -94,6 +94,14 @@ version:
    entry to `TIER_MODELS` off that data; re-run calibration if a stronger
    Codex model becomes accessible on this account (`gpt-5.6-sol` and several
    others 400 on the current login - see that section for the full list).
+   Same discipline applies to `classifier.TYPE_DOMAIN_GRID` (task_type x
+   domain -> tier), not just `TIER_MODELS` - see `llm-eval-harness/CLAUDE.md`,
+   "Router tier synthesis across all 7 suites" (2026-07-27) for the current
+   state: `code_gen`/`refactor` rows are now calibration-derived (uniform
+   `L`, zero discrimination found across all three Claude tiers on hardened
+   suites), the rest of the grid is still pillar 22's original heuristic,
+   not yet calibration-confirmed. Don't re-derive that table here; follow
+   the pointer.
 
 ## Installed CLI entrypoint
 

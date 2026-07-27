@@ -19,8 +19,12 @@ def test_architecture_is_uniformly_high():
     assert all(classify("architecture", domain) == "H" for domain in DOMAINS)
 
 
-def test_infra_code_gen_escalates_high():
-    assert classify("code_gen", "infra") == "H"
+def test_code_gen_is_uniformly_low():
+    assert all(classify("code_gen", domain) == "L" for domain in DOMAINS)
+
+
+def test_refactor_is_uniformly_low():
+    assert all(classify("refactor", domain) == "L" for domain in DOMAINS)
 
 
 def test_unknown_task_type_raises():
