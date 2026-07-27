@@ -3,6 +3,22 @@ eval_harness/claude_cli.py. Same rationale: run on the existing Claude Code
 subscription instead of a separately-billed API key, and strip the default
 system prompt + disable tools/MCP so we pay for a plain single-turn completion
 (~$0.003-0.005/call) instead of a full agent turn (~$0.07/call).
+
+check_auth() gates invoke() so an unauthenticated CLI fails fast with a clear
+error instead of falling through to `claude -p`'s own nonzero-exit path (which
+already surfaces auth errors, just after paying for the attempt and without a
+consistent message - see llm-eval-harness's CLAUDE.md for what an
+unauthenticated/inaccessible-account run looks like if it isn't caught: every
+case comes back a parse_error with a misleadingly bad-looking aggregate
+score). `claude auth status`'s logged-out shape is confirmed against real
+output, not guessed: `env -u ANTHROPIC_API_KEY claude --bare auth status`
+(2026-07-26) returns `{"loggedIn": false, "authMethod": "none",
+"apiProvider": "firstParty"}` at exit 1 - `--bare` mode explicitly skips
+keychain/OAuth reads per `claude --help`, so this exercises the real
+"no credentials resolved" code path without touching this account's actual
+stored login. Not tested: whether plain `claude auth status --json` (no
+`--bare`) on a genuinely logged-out machine emits byte-identical JSON -
+inferred to be the same schema, not separately confirmed.
 """
 
 import json
@@ -11,7 +27,29 @@ import subprocess
 from llm_task_router.schema import ProviderResult
 
 
+def check_auth() -> tuple[bool, str]:
+    try:
+        proc = subprocess.run(
+            ["claude", "auth", "status", "--json"], capture_output=True, text=True, timeout=10
+        )
+    except subprocess.TimeoutExpired:
+        return False, "auth check timed out"
+
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return False, "could not parse `claude auth status` output"
+
+    if payload.get("loggedIn"):
+        return True, ""
+    return False, "not logged in - run `claude auth login`"
+
+
 def invoke(prompt: str, model: str, system_prompt: str = "") -> ProviderResult:
+    authenticated, auth_error = check_auth()
+    if not authenticated:
+        return ProviderResult(text="", cost_usd=0.0, duration_ms=0, error=f"auth check failed: {auth_error}")
+
     cmd = [
         "claude",
         "-p",

@@ -40,6 +40,16 @@ Still NOT verified:
   - Behavior on an actual model error/refusal (partial file vs. empty vs.
     non-zero exit) is covered for the "invalid model name" case seen above
     (non-zero exit, no file), but not for a genuine content refusal.
+
+check_auth()'s two shapes are both confirmed against real output, not
+guessed - a real logged-in run prints plain text "Logged in using ChatGPT"
+at exit 0 (confirmed 2026-07-22); a real logged-out run, exercised via
+`CODEX_HOME=<empty dir> codex login status` (2026-07-26) - which points the
+CLI at a directory with no stored credentials without touching this
+account's actual `~/.codex` login - prints plain text "Not logged in" at
+exit 1. check_auth() treats anything containing "not logged in" as
+unauthenticated and anything else without "logged in" in it (or a nonzero
+exit) as unauthenticated too, rather than matching one exact string.
 """
 
 import subprocess
@@ -49,7 +59,24 @@ from pathlib import Path
 from llm_task_router.schema import ProviderResult
 
 
+def check_auth() -> tuple[bool, str]:
+    try:
+        proc = subprocess.run(["codex", "login", "status"], capture_output=True, text=True, timeout=10)
+    except subprocess.TimeoutExpired:
+        return False, "auth check timed out"
+
+    output = (proc.stdout + proc.stderr).strip()
+    normalized = output.lower()
+    if proc.returncode == 0 and "logged in" in normalized and "not logged in" not in normalized:
+        return True, ""
+    return False, output or "not logged in - run `codex login`"
+
+
 def invoke(prompt: str, model: str) -> ProviderResult:
+    authenticated, auth_error = check_auth()
+    if not authenticated:
+        return ProviderResult(text="", cost_usd=0.0, duration_ms=0, error=f"auth check failed: {auth_error}")
+
     with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as tmp:
         last_message_path = Path(tmp.name)
 

@@ -32,12 +32,19 @@ the code "looks done" after matching `--help` output alone.
    ProviderResult`. Prefer whatever mechanism gets you the final answer most
    directly (codex_cli.py uses `--output-last-message <tempfile>` rather than
    parsing a streamed JSONL event log) - simpler parsing, fewer ways to get
-   the shape wrong.
+   the shape wrong. Also add a `check_auth() -> tuple[bool, str]` using the
+   command identified in step 3, and have `invoke()` call it first and
+   short-circuit to `ProviderResult(error="auth check failed: ...")` without
+   touching the real model command when unauthenticated - see CLAUDE.md's
+   "Auth pre-flight check" for why (claude_cli.py/codex_cli.py both follow
+   this shape, use them as the template).
 
 5. **Write mocked-subprocess tests** in `tests/test_<name>.py`, mirroring
    `tests/test_claude_cli.py`/`tests/test_codex_cli.py`: assert the exact
    command list (not just that `subprocess.run` was called), plus timeout,
-   nonzero-exit, and missing-output-file paths.
+   nonzero-exit, missing-output-file, and check_auth() paths (both the
+   authenticated pass-through and the not-authenticated short-circuit that
+   asserts the real model command was never dispatched).
 
 6. **Do one real authenticated call** (confirm with the user first if it
    might cost money/quota) to verify the adapter actually works, not just

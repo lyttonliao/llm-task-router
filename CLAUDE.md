@@ -64,7 +64,10 @@ the adapter + mocked tests, one real authenticated call, register it). Short
 version:
 
 1. Add `llm_task_router/providers/<name>.py` with an `invoke(prompt, model)
-   -> ProviderResult` function, following `claude_cli.py`'s shape.
+   -> ProviderResult` function, following `claude_cli.py`'s shape - including
+   a `check_auth() -> tuple[bool, str]` that `invoke()` calls first (see
+   "Auth pre-flight check" below). Every existing provider has one; a new one
+   without it is a regression, not just an omission.
 2. Register it in `router.PROVIDERS` as a **module**, not a pre-grabbed
    function - `PROVIDERS = {"name": module}` then `.invoke(...)` at call
    time, not `{"name": module.invoke}`. The latter early-binds the reference
@@ -82,6 +85,52 @@ version:
    entry to `TIER_MODELS` off that data; re-run calibration if a stronger
    Codex model becomes accessible on this account (`gpt-5.6-sol` and several
    others 400 on the current login - see that section for the full list).
+
+## Auth pre-flight check
+
+Both provider adapters (`claude_cli.py`, `codex_cli.py`) now export a
+`check_auth() -> tuple[bool, str]` that `invoke()` calls before doing
+anything else - `claude auth status --json` (parses the `loggedIn` key) and
+`codex login status` (text-matches for "logged in" / "not logged in")
+respectively. An unauthenticated call now short-circuits to a single clear
+`ProviderResult(error="auth check failed: ...")` and never reaches the real
+model subprocess, instead of falling through to whatever failure shape the
+underlying CLI produces on its own (a nonzero exit with a stderr message that
+varies by CLI, or - in `llm-eval-harness`'s worst observed case for an
+inaccessible Codex account - every case coming back a `parse_error` with a
+misleadingly bad-looking aggregate score, see that repo's CLAUDE.md,
+"Codex model access is account-dependent"). This exists specifically to catch
+that failure mode at the single-call layer, before it can propagate into a
+multi-case run that looks like a real (terrible) quality result.
+
+Both adapters' logged-out output shapes are confirmed against real output
+(2026-07-26), not inferred - and neither required actually logging this dev
+account out of Claude/ChatGPT:
+
+- **Claude**: `env -u ANTHROPIC_API_KEY claude --bare auth status` returns
+  `{"loggedIn": false, "authMethod": "none", "apiProvider": "firstParty"}` at
+  exit 1. `--bare` mode explicitly skips keychain/OAuth reads (per
+  `claude --help`), so this exercises the real "no credentials resolved"
+  code path without touching the account's actual stored login.
+- **Codex**: `CODEX_HOME=<empty dir> codex login status` returns plain text
+  "Not logged in" at exit 1. Pointing `CODEX_HOME` at a directory with no
+  stored credentials gets the same effect for Codex that `--bare` gets for
+  Claude, without touching the account's actual `~/.codex` login.
+
+Reuse these two techniques for testing this gate in future sessions instead
+of reaching for a real logout - a real logout on either CLI requires an
+interactive re-auth flow to undo, which isn't worth the risk for a read-only
+verification. Both `check_auth()` implementations were already written
+defensively before this confirmation (treat anything that doesn't clearly
+parse as "logged in" as unauthenticated, not the other way around); the real
+output matched what was inferred, so no logic changes were needed, only the
+docstrings/tests moving from "assumed shape" to "confirmed shape with a
+regression test pinned to the real string."
+
+Adding a new provider should include its own `check_auth()` following this
+same shape (see "Adding a provider" below) - don't skip it just because the
+provider's own nonzero-exit path already surfaces auth errors eventually;
+the point is failing fast and consistently, not just failing.
 
 ## Known rough edges
 
