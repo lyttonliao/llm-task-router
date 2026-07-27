@@ -34,12 +34,18 @@ llm_task_router/
                     (see rough edges below for what's still unverified)
   classifier.py   - tier-1 heuristic rule table (type x domain grid)
   tiers.py        - tier name -> concrete (provider, model) mapping
+  known_models.py - static known-model table, display-only, NOT used for
+                    routing (see "llm-chat" below)
   router.py       - route() classifies + resolves a tier; route_and_run()
                     also invokes the provider
   cli.py          - `llm-route route <description> --type ... --domain ...`
                     (installed console script; `python -m llm_task_router
                     route ...` still works identically, cli.py is unchanged
                     either way - see "Installed CLI entrypoint" below)
+  repl.py         - `llm-chat`, interactive terminal client: authenticates
+                    each provider at startup, then routes each message
+                    independently via route_and_run() (stateless,
+                    single-shot - see "llm-chat" below)
 ```
 
 ## The classifier is a three-tier cascade; only tier 1 exists
@@ -101,6 +107,72 @@ change shape - only `ArgumentParser(prog=...)` was updated from the old
 `"python -m llm_task_router"` to `"llm-route"` so `--help` output matches the
 way it's actually invoked now. Both invocation styles keep working
 side by side; there's no reason to remove the `-m` path.
+
+## llm-chat: interactive terminal client
+
+`llm-chat` (`repl.py`, registered the same way `llm-route` is - see
+"Installed CLI entrypoint") is a real interactive session: authenticate once
+per provider, then type messages in a loop and get routed responses printed
+back verbatim with a model-used indicator, the terminal-native counterpart
+to `llm-route`'s one-shot invocation. Built specifically so engineers
+without an API budget can still get a live-routing chat experience off
+their existing Claude/ChatGPT subscriptions - no code path here touches
+`ANTHROPIC_API_KEY`/`OPENAI_API_KEY`, matching this repo's "subscription
+CLIs, not API keys" rationale.
+
+**Stateless, single-shot per message, deliberately, for v1.** Every message
+in a session routes independently through `route_and_run()` completely
+unmodified - no conversation history is sent to the model, and a session
+can land a different message on a different model/tier with zero special
+handling. This is a real limitation, not an oversight: both `claude -p` and
+`codex exec` already expose session-continuation flags (`--session-id`/
+`--continue`/`--resume` and `codex exec resume` respectively) that a v2
+could use. The seam for that: `TaskRequest` could gain an optional
+`session_id: str | None = None` field (backward-compatible default), and
+provider `invoke()` could gain an optional continuation kwarg mapping to
+those flags. None of this exists yet - it's a seam, not a partial
+implementation, and multi-turn continuity has a real complication worth
+solving deliberately rather than bolting on: switching which provider/tier
+a message routes to mid-conversation breaks continuity, since each CLI's
+session state is local to that CLI.
+
+**Login is always handed off to the provider's own interactive command,
+never driven programmatically.** `claude_cli.login()` and `codex_cli.login()`
+both shell out with **inherited stdio** (no `capture_output`/`timeout`) to
+`claude auth login --claudeai` (the subscription flow, not `--console`) and
+`codex login` respectively, so the user completes the real OAuth/device flow
+directly in the same terminal - `repl.py` never attempts to complete or
+parse that flow itself. This extends the `add-provider` skill's existing
+rule ("never attempt to complete an OAuth/browser login flow on their
+behalf") to say the *client*, not just the developer working on this repo,
+must always defer to the CLI's own login command. Neither `login()`'s exit
+code is trusted as proof of success - `repl.py` always re-runs `check_auth()`
+afterward as the real source of truth, same discipline `invoke()` already
+uses. `codex_cli.login()` accepts an unwired `device_auth: bool = False`
+param for a future headless/SSH login prompt; nothing calls it with `True`
+yet.
+
+**`known_models.py` is informational only - never consulted by `route()`/
+`route_and_run()`.** It's a hardcoded table of model slugs already confirmed
+reachable via this account's calibration history (see "Known rough edges"
+below for the Codex slug list), used solely so `repl.py`'s startup summary
+can tell the user roughly what's usable given who they authenticated with.
+Same staleness risk as the Codex slug list it's drawn from - re-verify with
+a real call before trusting it for anything beyond display.
+
+**Named limitation: authenticating Codex alone currently makes zero tiers
+routable.** `tiers.TIER_MODELS` maps every tier (`cheap`/`mid`/`flagship`) to
+`"claude"` today (see "Known rough edges" - no Codex model has cleared a
+tier floor yet), so `repl.startup_auth_check()` can report Codex as
+authenticated while `repl.routable_tiers()` still returns an empty routable
+set, and `main()` refuses to start the chat loop with a clear message rather
+than silently letting every message fail one at a time. This is a direct,
+expected consequence of `tiers.py`'s current calibration state, not a bug in
+`repl.py`, and not something this feature tries to work around.
+`tests/test_repl.py::test_routable_tiers_against_real_tier_models_with_only_codex_authenticated`
+is pinned against the real `TIER_MODELS` specifically so it starts failing
+(in the good way) the day a Codex tier gets calibrated in - that failure is
+the signal this paragraph needs updating, not a regression.
 
 ## Auth pre-flight check
 

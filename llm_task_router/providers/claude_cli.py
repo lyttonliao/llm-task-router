@@ -27,6 +27,22 @@ import subprocess
 from llm_task_router.schema import ProviderResult
 
 
+def login() -> int:
+    """Shells to `claude auth login --claudeai` - the subscription login
+    flow, not `--console` (API-key/billing), matching this repo's no-API-key
+    philosophy. Deliberately no capture_output/text/timeout: stdio is
+    inherited from the parent process so the user completes the OAuth flow
+    (browser prompt, confirmation) directly in the same terminal, same as
+    running the command themselves. The returned exit code is NOT trusted as
+    proof the login actually succeeded - it's unconfirmed whether this can
+    exit 0 without the flow completing (e.g. the user closes the browser tab
+    partway through). Callers must re-run check_auth() afterward as the real
+    source of truth, the same way invoke() already does before every call.
+    """
+    proc = subprocess.run(["claude", "auth", "login", "--claudeai"])
+    return proc.returncode
+
+
 def check_auth() -> tuple[bool, str]:
     try:
         proc = subprocess.run(

@@ -2,7 +2,7 @@ import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
-from llm_task_router.providers.codex_cli import check_auth, invoke
+from llm_task_router.providers.codex_cli import check_auth, invoke, login
 
 
 def _completed(returncode=0, stdout="", stderr=""):
@@ -32,6 +32,27 @@ def _with_auth_ok(fake_run):
         return fake_run(cmd, **kwargs)
 
     return wrapped
+
+
+def test_login_shells_default_command_with_inherited_stdio():
+    """No capture_output/text/timeout - stdio must stay inherited so the
+    user can actually complete the browser flow in the terminal."""
+    with patch("llm_task_router.providers.codex_cli.subprocess.run", return_value=_completed()) as mock_run:
+        login()
+
+    assert mock_run.call_args == ((["codex", "login"],), {})
+
+
+def test_login_with_device_auth_appends_flag():
+    with patch("llm_task_router.providers.codex_cli.subprocess.run", return_value=_completed()) as mock_run:
+        login(device_auth=True)
+
+    assert mock_run.call_args == ((["codex", "login", "--device-auth"],), {})
+
+
+def test_login_returns_child_returncode():
+    with patch("llm_task_router.providers.codex_cli.subprocess.run", return_value=_completed(returncode=1)):
+        assert login() == 1
 
 
 def test_check_auth_true_when_logged_in():

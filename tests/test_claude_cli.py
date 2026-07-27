@@ -2,7 +2,7 @@ import json
 import subprocess
 from unittest.mock import patch
 
-from llm_task_router.providers.claude_cli import check_auth, invoke
+from llm_task_router.providers.claude_cli import check_auth, invoke, login
 
 
 def _completed(stdout="", stderr="", returncode=0):
@@ -15,6 +15,24 @@ def _auth_ok():
 
 def _auth_fail():
     return _completed(stdout=json.dumps({"loggedIn": False}))
+
+
+def test_login_shells_expected_command_with_inherited_stdio():
+    """--claudeai (not --console) is the subscription flow, not the API-key
+    one - a regression here would silently point users at billed API auth.
+    Asserting the exact call_args (positional cmd only, no kwargs) is the
+    regression guard for stdio inheritance: capture_output/text/timeout must
+    stay absent so the user can actually complete the OAuth flow in the
+    terminal instead of it being captured and discarded."""
+    with patch("llm_task_router.providers.claude_cli.subprocess.run", return_value=_completed()) as mock_run:
+        login()
+
+    assert mock_run.call_args == ((["claude", "auth", "login", "--claudeai"],), {})
+
+
+def test_login_returns_child_returncode():
+    with patch("llm_task_router.providers.claude_cli.subprocess.run", return_value=_completed(returncode=1)):
+        assert login() == 1
 
 
 def test_check_auth_true_when_logged_in():

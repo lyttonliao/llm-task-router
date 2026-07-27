@@ -59,6 +59,21 @@ from pathlib import Path
 from llm_task_router.schema import ProviderResult
 
 
+def login(device_auth: bool = False) -> int:
+    """Shells to `codex login` (browser flow) or `codex login --device-auth`
+    when device_auth is set, for a future headless/SSH login path - nothing
+    in this repo passes device_auth=True yet, it's an intentionally unwired
+    parameter. Same "inherited stdio, don't trust the exit code" shape as
+    claude_cli.login(): no capture_output/text/timeout so the user completes
+    the flow directly in the terminal, and the caller must re-run
+    check_auth() afterward rather than trust this return code."""
+    cmd = ["codex", "login"]
+    if device_auth:
+        cmd.append("--device-auth")
+    proc = subprocess.run(cmd)
+    return proc.returncode
+
+
 def check_auth() -> tuple[bool, str]:
     try:
         proc = subprocess.run(["codex", "login", "status"], capture_output=True, text=True, timeout=10)
