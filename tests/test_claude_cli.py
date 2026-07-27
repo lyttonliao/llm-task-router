@@ -194,6 +194,42 @@ def test_builds_expected_command_without_cost_guardrail_flags_by_default():
     assert kwargs["text"] is True
 
 
+def test_disable_tools_true_adds_strip_flags():
+    """disable_tools is opt-in for internal one-shot callers (e.g. router.py's
+    tier-3 classifier) that shouldn't inherit llm-chat's full-functionality
+    cost profile - see invoke()'s docstring. Uses the same two flags
+    eval_harness's own stripped adapter uses."""
+    fake_proc = _FakeProcess(stdout_lines=[_result_line()])
+    with (
+        patch("llm_task_router.providers.claude_cli.subprocess.run", return_value=_auth_ok()),
+        patch("llm_task_router.providers.claude_cli.subprocess.Popen", return_value=fake_proc) as mock_popen,
+        patch("llm_task_router.providers.claude_cli.select.select", side_effect=_always_ready()),
+    ):
+        invoke("classify this", model="haiku", disable_tools=True)
+
+    cmd = mock_popen.call_args[0][0]
+    assert "--disallowed-tools" in cmd
+    assert cmd[cmd.index("--disallowed-tools") + 1] == "*"
+    assert "--strict-mcp-config" in cmd
+
+
+def test_disable_tools_false_by_default_matches_prior_full_functionality_command():
+    """Regression guard: omitting disable_tools entirely must produce the
+    exact same command as before this parameter existed - llm-chat's real
+    messages must never accidentally pick up the strip flags."""
+    fake_proc = _FakeProcess(stdout_lines=[_result_line()])
+    with (
+        patch("llm_task_router.providers.claude_cli.subprocess.run", return_value=_auth_ok()),
+        patch("llm_task_router.providers.claude_cli.subprocess.Popen", return_value=fake_proc) as mock_popen,
+        patch("llm_task_router.providers.claude_cli.select.select", side_effect=_always_ready()),
+    ):
+        invoke("do the task", model="haiku")
+
+    cmd = mock_popen.call_args[0][0]
+    assert "--disallowed-tools" not in cmd
+    assert "--strict-mcp-config" not in cmd
+
+
 def test_invoke_omits_session_flags_when_session_id_not_provided():
     fake_proc = _FakeProcess(stdout_lines=[_result_line()])
     with (

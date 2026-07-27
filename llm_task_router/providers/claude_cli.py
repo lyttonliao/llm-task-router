@@ -128,7 +128,17 @@ def invoke(
     *,
     session_id: str | None = None,
     on_event: Callable[[dict], None] | None = None,
+    disable_tools: bool = False,
 ) -> ProviderResult:
+    """disable_tools (default False - every existing call site/test is
+    unaffected) adds --disallowed-tools "*" --strict-mcp-config, the same
+    two flags eval_harness's own stripped claude_cli.py uses, at that
+    repo's documented ~$0.003-0.005/call vs this adapter's normal
+    ~$0.07-0.30/call full-functionality cost. This exists for internal,
+    one-shot calls (e.g. router.py's tier-3 classification fallback) that
+    have no business running tools and shouldn't inherit llm-chat's
+    full-functionality cost profile just because they share this adapter -
+    llm-chat's own real messages must never pass this, by design."""
     authenticated, auth_error = check_auth()
     if not authenticated:
         return ProviderResult(text="", cost_usd=0.0, duration_ms=0, error=f"auth check failed: {auth_error}")
@@ -146,6 +156,8 @@ def invoke(
         "--permission-mode",
         "bypassPermissions",
     ]
+    if disable_tools:
+        cmd += ["--disallowed-tools", "*", "--strict-mcp-config"]
     if system_prompt:
         cmd += ["--system-prompt", system_prompt]
 

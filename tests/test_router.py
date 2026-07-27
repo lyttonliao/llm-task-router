@@ -71,20 +71,112 @@ def test_route_does_not_second_guess_an_explicit_caller_provided_type():
     assert decision.model == "opus"
 
 
-def test_route_hedges_to_mid_not_flagship_when_no_keyword_signal_on_either_axis():
+def test_route_hedges_to_mid_when_no_keyword_signal_and_tier3_is_unavailable():
     """Regression guard for a real incident: a trivial toy prompt with zero
     keyword overlap on either axis ("reply with exactly the word: pong")
     used to silently inherit architecture's uniform-H row via
     classify_description()'s label-only fallback, routing a $0.0002 task to
-    opus at real cost (~$0.18 observed). Total absence of signal must hedge
-    at mid, not flagship - flagship is earned by an actual signal, not
-    awarded to "we don't know"."""
+    opus at real cost (~$0.18 observed). This no longer reflects the steady
+    state (tier-3's cheap-LLM fallback now classifies this correctly as
+    cheap - see the test_route_no_signal_llm_fallback_* tests below) - this
+    test mocks tier-3 as unavailable specifically to pin the *fallback*
+    behavior: total absence of signal, with no tier-3 answer to lean on
+    either, must still hedge at mid, not flagship - flagship is earned by an
+    actual signal, not awarded to "we don't know"."""
     request = TaskRequest(description="reply with exactly the word: pong")
-    decision = route(request)
+    with patch(
+        "llm_task_router.router.claude_cli.invoke",
+        return_value=ProviderResult(text="", cost_usd=0.0, duration_ms=0, error="mocked - not exercising tier-3 here"),
+    ):
+        decision = route(request)
 
     assert decision.tier == "mid"
     assert decision.model == "sonnet"
-    assert "no keyword signal" in decision.reason
+    assert "unavailable" in decision.reason
+
+
+def test_route_no_signal_llm_fallback_returns_cheap():
+    request = TaskRequest(description="repeat this word: hello")
+    with patch(
+        "llm_task_router.router.claude_cli.invoke",
+        return_value=ProviderResult(text="CHEAP", cost_usd=0.003, duration_ms=400),
+    ) as mock_invoke:
+        decision = route(request)
+
+    assert decision.tier == "cheap"
+    assert decision.model == "haiku"
+    assert "cheap" in decision.reason
+    args, kwargs = mock_invoke.call_args
+    assert args[1] == "haiku"
+    assert kwargs["disable_tools"] is True
+    assert "session_id" not in kwargs
+    assert "on_event" not in kwargs
+
+
+def test_route_no_signal_llm_fallback_returns_mid():
+    request = TaskRequest(description="repeat this word: hello")
+    with patch(
+        "llm_task_router.router.claude_cli.invoke",
+        return_value=ProviderResult(text="MID", cost_usd=0.003, duration_ms=400),
+    ):
+        decision = route(request)
+
+    assert decision.tier == "mid"
+    assert decision.model == "sonnet"
+    assert "mid" in decision.reason
+
+
+def test_route_no_signal_llm_fallback_returns_flagship():
+    request = TaskRequest(description="repeat this word: hello")
+    with patch(
+        "llm_task_router.router.claude_cli.invoke",
+        return_value=ProviderResult(text="FLAGSHIP", cost_usd=0.003, duration_ms=400),
+    ):
+        decision = route(request)
+
+    assert decision.tier == "flagship"
+    assert decision.model == "opus"
+    assert "flagship" in decision.reason
+
+
+def test_route_no_signal_llm_fallback_unparseable_text_falls_back_to_mid():
+    request = TaskRequest(description="repeat this word: hello")
+    with patch(
+        "llm_task_router.router.claude_cli.invoke",
+        return_value=ProviderResult(text="uh, I'm not sure?", cost_usd=0.003, duration_ms=400),
+    ):
+        decision = route(request)
+
+    assert decision.tier == "mid"
+    assert decision.model == "sonnet"
+    assert "unavailable or returned an unparseable response" in decision.reason
+
+
+def test_route_no_signal_llm_fallback_provider_error_falls_back_to_mid():
+    request = TaskRequest(description="repeat this word: hello")
+    with patch(
+        "llm_task_router.router.claude_cli.invoke",
+        return_value=ProviderResult(text="", cost_usd=0.0, duration_ms=0, error="auth check failed: not logged in"),
+    ):
+        decision = route(request)
+
+    assert decision.tier == "mid"
+    assert decision.model == "sonnet"
+
+
+def test_route_no_signal_llm_fallback_exception_falls_back_to_mid():
+    """Load-bearing, not defensive-programming theater: invoke() really can
+    raise (check_auth()'s subprocess.run has no FileNotFoundError guard), so
+    _classify_via_llm()'s try/except must actually catch it."""
+    request = TaskRequest(description="repeat this word: hello")
+    with patch(
+        "llm_task_router.router.claude_cli.invoke",
+        side_effect=RuntimeError("boom"),
+    ):
+        decision = route(request)
+
+    assert decision.tier == "mid"
+    assert decision.model == "sonnet"
 
 
 def test_route_uses_grid_normally_when_only_domain_axis_is_unresolved():

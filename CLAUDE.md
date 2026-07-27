@@ -99,15 +99,63 @@ is a real, accepted tradeoff: a genuinely hard task that doesn't happen to
 use recognized high-stakes vocabulary (e.g. "migrate the k8s cluster to a
 new region" - no "multi-region"/"disaster recovery" wording) will now be
 underrouted to `mid` rather than reaching flagship. That's the documented
-cost of not having tier 2/3 of the cascade below built yet - closing it for
-real needs the trained model or cheap-LLM-judgment tier, not a longer
-guessed keyword list (same "widen against real output, not speculation"
-discipline `llm-eval-harness`'s CLAUDE.md documents for phrase-group
-widening generally).
+cost of not having the rest of the cascade built yet - closing it for real
+needs the trained model tier (tier 2, still not built) or a longer guessed
+keyword list, which is exactly what the discipline below rejects.
 
-Adding tier 2 or 3 means giving `classifier.classify()` a confidence signal
-and having `router.route()` fall through to the next tier when it's low -
-don't restructure `route()`'s shape to do this, extend it.
+**Fix 3 - tier 3 (cheap-LLM fallback) built for the no-signal band,
+2026-07-27.** The no-signal hedge (Fix 1) still routed every unclassifiable
+description to `mid` uniformly - including genuinely trivial ones. A trivial
+toy prompt ("repeat this word: hello") should cost the cheap tier, not
+sonnet. A `TRIVIAL_KEYWORDS` list (symmetric to `IMPACT_KEYWORDS`) was tried
+and explicitly rejected: it doesn't generalize ("string matching and regex
+limitations are proving insufficient" - too many phrasings to enumerate). A
+vector-DB/embeddings alternative was considered next and also rejected: it
+breaks this repo's zero-third-party-dependency rule, and - more
+importantly - `llm-eval-harness`'s own CLAUDE.md already ran this exact
+experiment for a structurally similar soft-semantic-matching problem and
+found embeddings don't cleanly separate it (concrete-vs-abstract phrasing
+scored 0.54-0.60 cosine similarity with no threshold separating real
+signal from same-case noise, and a bigger model didn't help - see that
+repo's "regex, not AST or embeddings" section). **Built instead: `router.py`'s
+own already-planned tier 3** ("a cheap-LLM-call fallback for the remaining
+ambiguity band," named in this module's own docstring before this fix
+existed). `_classify_via_llm()` makes one haiku call, asking the model to
+judge the description's actual difficulty/consequence/ambiguity directly -
+a judgment call, which a small model is structurally better suited for than
+keyword matching. Scoped to the no-signal branch only; the
+`needs_corroboration` branch (Fix 2) is untouched - it has a different
+failure mode (underrouting a possibly-hard task, not overrouting a trivial
+one) and deserves separate review.
+
+This call reuses `providers/claude_cli.py`'s `invoke()`, but **not**
+unchanged - that adapter is deliberately full-functionality for `llm-chat`
+(~$0.07-0.30/call, see "llm-chat: interactive terminal client" above), and
+calling it as-is for an internal one-word classification would have cost
+about as much as the misroute it's meant to prevent, plus left tool
+execution enabled on a call with no business touching tools. `invoke()`
+gained an opt-in `disable_tools: bool = False` param (default `False` -
+every existing call site is unaffected) that adds `--disallowed-tools "*"
+--strict-mcp-config`, the same two flags `eval_harness`'s own stripped
+adapter uses; `_classify_via_llm()` passes that plus an explicit
+classifier-persona `system_prompt`, landing this call in `eval_harness`'s
+~$0.003-0.005/call bracket instead of `llm-chat`'s. `_classify_via_llm()`
+returns `None` (never raises) on a provider error, unparseable response, or
+any exception - `check_auth()`'s `subprocess.run` has no `FileNotFoundError`
+guard, so `invoke()` is not exception-safe, and `route()` treats `None` as
+"fall back to the existing mid hedge," not as a crash.
+
+**Cost/latency, stated plainly**: every no-signal request now costs one
+extra (stripped, cheap-bracket) haiku call and adds latency before the real
+task call starts. This is a genuine tradeoff against the zero-cost tier-1
+path, accepted because it's what actually lets a trivial request reach the
+cheap tier instead of either overpaying at mid (the old hedge) or
+misclassifying via a keyword list that won't generalize.
+
+Adding tier 2 (or extending tier 3 to the `needs_corroboration` branch)
+means giving `classifier.classify()` a confidence signal and having
+`router.route()` fall through when it's low - don't restructure `route()`'s
+shape to do this, extend it, the same way tier 3 was added here.
 
 ## Adding a provider
 
