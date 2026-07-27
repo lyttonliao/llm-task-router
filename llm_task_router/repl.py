@@ -6,11 +6,23 @@ across messages even as the classifier routes different messages to
 different Claude tiers/models - see CLAUDE.md, "llm-chat: interactive
 terminal client" for the real-CLI verification this rests on and for why
 cross-provider continuity (Codex) isn't part of this.
+
+Streaming + styling, added 2026-07-27: chat_loop() prints the routing header
+as soon as route_and_run() resolves it (via on_decision), then streams the
+model's answer live token-by-token as it arrives (via on_event ->
+tui.StreamRenderer) instead of waiting for the full response and printing it
+all at once - see tui.py for the ANSI styling and claude_cli.py for the
+stream-json transport this rides on. format_response() is kept as the
+non-streaming full-message formatter (still exercised by tests as the text
+contract, and available to any future caller without live on_event wiring),
+but chat_loop's success path no longer calls it directly - doing so would
+print the answer a second time after it was already streamed.
 """
 
 import sys
 import uuid
 
+from llm_task_router import tui
 from llm_task_router.known_models import known_models_for
 from llm_task_router.router import PROVIDERS, route_and_run
 from llm_task_router.schema import TaskRequest
@@ -97,17 +109,19 @@ def routable_tiers(authenticated_providers: set[str], tier_models: dict = TIER_M
 
 
 def print_startup_summary(authenticated_providers: set[str], routable: dict, unroutable: dict, *, print_fn=print) -> None:
-    print_fn("\nAuthenticated providers:")
+    print_fn(f"\n{tui.DIM}Authenticated providers:{tui.RESET}")
     for name in sorted(authenticated_providers):
-        print_fn(f"  {name}: known models (reference only) = {known_models_for(name)}")
+        color = tui.provider_color(name)
+        print_fn(f"  {color}{name}{tui.RESET}: known models (reference only) = {known_models_for(name)}")
 
-    print_fn("\nRoutable tiers:")
+    print_fn(f"\n{tui.DIM}Routable tiers:{tui.RESET}")
     for tier, (provider, model) in routable.items():
-        print_fn(f"  {tier}: {provider}/{model}")
+        color = tui.provider_color(provider)
+        print_fn(f"  {tier}: {color}{provider}/{model}{tui.RESET}")
 
     for tier, (provider, model) in unroutable.items():
         print_fn(
-            f"[warning] tier '{tier}' maps to '{provider}/{model}' but you're not "
+            f"{tui.ERROR_COLOR}[warning]{tui.RESET} tier '{tier}' maps to '{provider}/{model}' but you're not "
             f"authenticated with {provider} - messages classified into this tier "
             f"will fail with an auth error until you log in."
         )
@@ -115,13 +129,17 @@ def print_startup_summary(authenticated_providers: set[str], routable: dict, unr
 
 
 def format_response(decision, result) -> str:
-    header = f"[{decision.provider}/{decision.model}, tier={decision.tier}]"
+    """Non-streaming full-message formatter - kept as the pinned text
+    contract (see tests) and available to any future caller with no live
+    on_event wiring. chat_loop's success path does not call this (see module
+    docstring)."""
+    header = tui.header(decision)
     if result.error:
-        return f"{header} error: {result.error}"
-    return f"{header}\n{result.text}\n(cost ${result.cost_usd:.4f}, {result.duration_ms}ms)"
+        return f"{header} {tui.error_line(result.error)}"
+    return f"{header}\n{result.text}\n{tui.footer(result)}"
 
 
-def chat_loop(*, input_fn=input, print_fn=print) -> None:
+def chat_loop(*, input_fn=input, print_fn=print, write_fn=tui.default_write) -> None:
     """One session_id, generated once here (not per message), is attached to
     every TaskRequest built in this loop - route_and_run() -> claude_cli.invoke()
     turns that into --session-id on the first call and --resume on every call
@@ -130,11 +148,24 @@ def chat_loop(*, input_fn=input, print_fn=print) -> None:
     provider the user skipped at login needs no special handling here:
     invoke() already runs its own check_auth() first, so it naturally comes
     back as ProviderResult(error="auth check failed: ..."), which flows
-    through format_response()'s normal error path."""
+    through the same error-print path below.
+
+    write_fn is separate from print_fn: print_fn emits discrete, newline-
+    terminated lines (header, footer, errors - what tests assert on),
+    write_fn emits raw, unterminated chunks for live token streaming
+    (defaults to real stdout, see tui.default_write) - collapsing these into
+    one parameter would make either the streamed text or the line-based
+    assertions awkward to test, not both.
+
+    A boxed input frame (top/bottom border around each prompt) was tried and
+    removed the same day: it can't wrap around input that line-wraps in the
+    terminal without raw terminal mode and a hand-rolled line editor (the
+    same bigger build declined for live-redraw streaming) - see tui.py's
+    module docstring for the full rationale. Plain styled prompt only."""
     session_id = str(uuid.uuid4())
     while True:
         try:
-            line = input_fn("you> ")
+            line = input_fn(tui.prompt())
         except EOFError:
             print_fn()
             break
@@ -153,8 +184,13 @@ def chat_loop(*, input_fn=input, print_fn=print) -> None:
             continue
 
         request = TaskRequest(description=line, session_id=session_id)
+        renderer = tui.StreamRenderer(write_fn=write_fn)
         try:
-            decision, result = route_and_run(request)
+            decision, result = route_and_run(
+                request,
+                on_event=renderer.handle,
+                on_decision=lambda d: print_fn(tui.header(d)),
+            )
         except Exception as exc:
             # Deliberate broad catch, unlike every other layer of this repo:
             # provider adapters already convert every anticipated failure
@@ -166,7 +202,11 @@ def chat_loop(*, input_fn=input, print_fn=print) -> None:
             print_fn(f"[internal error] {exc!r} - message not sent, session continues")
             continue
 
-        print_fn(format_response(decision, result))
+        renderer.finish()
+        if result.error:
+            print_fn(tui.error_line(result.error))
+        else:
+            print_fn(tui.footer(result))
 
 
 def main() -> None:

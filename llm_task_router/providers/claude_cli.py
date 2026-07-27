@@ -42,12 +42,44 @@ keychain/OAuth reads per `claude --help`, so this exercises the real
 stored login. Not tested: whether plain `claude auth status --json` (no
 `--bare`) on a genuinely logged-out machine emits byte-identical JSON -
 inferred to be the same schema, not separately confirmed.
+
+Transport: `--output-format stream-json`, not `json`, added 2026-07-27.
+`--output-format=stream-json` in print mode requires `--verbose` (confirmed:
+omitting it is a hard CLI error, "requires --verbose") and, with
+`--include-partial-messages`, emits one JSON event per line (NDJSON) instead
+of one blob at EOF - confirmed against a real haiku call: `system`/init and
+`status` events, then per-content-block `stream_event`s (`content_block_start`
+with `content_block.type` in `{"thinking","text","tool_use"}`,
+`content_block_delta` with `delta.type` in `{"thinking_delta","text_delta",
+"signature_delta","input_json_delta"}`), and a final line with
+`"type":"result"` carrying the same `result`/`total_cost_usd`/`duration_ms`/
+`is_error` fields the old single-blob `json` format put at top level. `invoke()`
+now reads NDJSON lines via `_drain()` instead of `json.loads()`-ing one
+`proc.stdout` blob, and forwards every parsed event to an optional `on_event`
+callback (used by `repl.py`'s live-streaming terminal renderer) before
+checking `event["type"] == "result"`.
+
+`_drain()` uses `select.select()` over *both* `stdout` and `stderr` pipes,
+not a plain `for line in proc.stdout` loop - the latter would reintroduce the
+classic subprocess pipe-deadlock (child blocks writing to a full stderr pipe
+while we block waiting for stdout EOF that never comes), the exact failure
+class `subprocess.run(capture_output=True)` avoided for free internally. Only
+tested on Unix (`select()` doesn't support pipes on Windows) - fine for this
+repo's Darwin dev environment, not verified elsewhere. The 300s timeout is
+enforced via a wall-clock deadline checked every loop iteration, not
+`subprocess.run`'s own `timeout=` kwarg, since Popen has no equivalent for an
+incrementally-read stream.
 """
 
 import json
+import select
 import subprocess
+import time
+from collections.abc import Callable
 
 from llm_task_router.schema import ProviderResult
+
+TIMEOUT_S = 300
 
 
 def login() -> int:
@@ -89,7 +121,14 @@ def check_auth() -> tuple[bool, str]:
 _established_sessions: set[str] = set()
 
 
-def invoke(prompt: str, model: str, system_prompt: str = "", *, session_id: str | None = None) -> ProviderResult:
+def invoke(
+    prompt: str,
+    model: str,
+    system_prompt: str = "",
+    *,
+    session_id: str | None = None,
+    on_event: Callable[[dict], None] | None = None,
+) -> ProviderResult:
     authenticated, auth_error = check_auth()
     if not authenticated:
         return ProviderResult(text="", cost_usd=0.0, duration_ms=0, error=f"auth check failed: {auth_error}")
@@ -101,7 +140,9 @@ def invoke(prompt: str, model: str, system_prompt: str = "", *, session_id: str 
         "--model",
         model,
         "--output-format",
-        "json",
+        "stream-json",
+        "--include-partial-messages",
+        "--verbose",
         "--permission-mode",
         "bypassPermissions",
     ]
@@ -112,21 +153,28 @@ def invoke(prompt: str, model: str, system_prompt: str = "", *, session_id: str 
     if session_id:
         cmd += ["--resume", session_id] if resuming else ["--session-id", session_id]
 
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-    except subprocess.TimeoutExpired:
-        return ProviderResult(text="", cost_usd=0.0, duration_ms=300_000, error="timeout")
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+    result_event, stderr_text, timed_out = _drain(proc, on_event)
 
-    if proc.returncode != 0:
-        return ProviderResult(text="", cost_usd=0.0, duration_ms=0, error=proc.stderr.strip() or "nonzero exit")
+    if timed_out:
+        proc.kill()
+        proc.wait()
+        return ProviderResult(text="", cost_usd=0.0, duration_ms=TIMEOUT_S * 1000, error="timeout")
 
-    try:
-        payload = json.loads(proc.stdout)
-    except json.JSONDecodeError:
-        return ProviderResult(text=proc.stdout, cost_usd=0.0, duration_ms=0, error="could not parse CLI json output")
+    proc.wait()
+    if proc.returncode != 0 and result_event is None:
+        return ProviderResult(text="", cost_usd=0.0, duration_ms=0, error=stderr_text.strip() or "nonzero exit")
 
-    if payload.get("is_error"):
-        return ProviderResult(text="", cost_usd=0.0, duration_ms=0, error=payload.get("result", "unknown CLI error"))
+    if result_event is None:
+        return ProviderResult(text="", cost_usd=0.0, duration_ms=0, error="no result event received")
+
+    if result_event.get("is_error"):
+        return ProviderResult(
+            text="",
+            cost_usd=0.0,
+            duration_ms=result_event.get("duration_ms", 0),
+            error=result_event.get("result", "unknown CLI error"),
+        )
 
     # Only mark the session established once we know the call that was
     # supposed to create it actually succeeded - see module docstring.
@@ -134,7 +182,58 @@ def invoke(prompt: str, model: str, system_prompt: str = "", *, session_id: str 
         _established_sessions.add(session_id)
 
     return ProviderResult(
-        text=payload.get("result", ""),
-        cost_usd=payload.get("total_cost_usd", 0.0),
-        duration_ms=payload.get("duration_ms", 0),
+        text=result_event.get("result", ""),
+        cost_usd=result_event.get("total_cost_usd", 0.0),
+        duration_ms=result_event.get("duration_ms", 0),
     )
+
+
+def _drain(proc: subprocess.Popen, on_event: Callable[[dict], None] | None) -> tuple[dict | None, str, bool]:
+    """Reads stdout (NDJSON events) and stderr concurrently via select() so
+    neither pipe's OS buffer can fill and deadlock the child - see module
+    docstring. Returns (result_event, stderr_text, timed_out); result_event
+    is the parsed `{"type": "result", ...}` line if one arrived before EOF/
+    timeout, else None."""
+    deadline = time.monotonic() + TIMEOUT_S
+    open_streams = {proc.stdout, proc.stderr}
+    result_event = None
+    stderr_chunks: list[str] = []
+
+    while open_streams:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return result_event, "".join(stderr_chunks), True
+
+        ready, _, _ = select.select(list(open_streams), [], [], remaining)
+        for stream in ready:
+            line = stream.readline()
+            if line == "":
+                open_streams.discard(stream)
+                continue
+            if stream is proc.stderr:
+                stderr_chunks.append(line)
+                continue
+
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            if on_event:
+                # Broad, deliberate catch: a bug in a terminal renderer
+                # shouldn't lose an already-in-flight, already-paid-for model
+                # call - same "an interactive session dying entirely over one
+                # unanticipated exception is worse UX" reasoning repl.py's
+                # chat_loop already applies to route_and_run().
+                try:
+                    on_event(event)
+                except Exception:
+                    pass
+
+            if event.get("type") == "result":
+                result_event = event
+
+    return result_event, "".join(stderr_chunks), False

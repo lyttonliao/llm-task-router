@@ -46,6 +46,9 @@ llm_task_router/
                     each provider at startup, then routes each message
                     independently via route_and_run() (stateless,
                     single-shot - see "llm-chat" below)
+  tui.py          - stdlib-only ANSI styling for repl.py's live-streaming
+                    terminal output (see "Streaming transport + ANSI
+                    styling" below)
 ```
 
 ## The classifier is a three-tier cascade; only tier 1 exists
@@ -188,6 +191,88 @@ message routes to mid-conversation would still break continuity, since each
 CLI's session state is local to that CLI. Constraining this feature to
 Claude-only wasn't a new limitation introduced by this change - it formalizes
 what was already true.
+
+**Streaming transport + ANSI styling, added 2026-07-27.** Two related but
+separate changes, both scoped to `llm-chat` only (`llm-route`'s one-shot
+`cli.py` path is unaffected beyond riding the same transport):
+
+- `claude_cli.py` switched from `--output-format json` (one blob, read after
+  the process exits) to `--output-format stream-json --include-partial-messages
+  --verbose` (one JSON event per line, readable as they arrive). `--verbose`
+  is not optional - confirmed via real output, omitting it is a hard CLI
+  error ("requires --verbose"). `invoke()` now shells out via `subprocess.Popen`
+  instead of `subprocess.run`, and a new `_drain()` helper reads `stdout`
+  (NDJSON events) and `stderr` concurrently via `select.select()` - not a
+  plain `for line in proc.stdout` loop, which would reintroduce the classic
+  pipe-deadlock `subprocess.run(capture_output=True)` avoided for free
+  (child blocks writing to a full stderr pipe while we block waiting for
+  stdout EOF that never arrives). The 300s timeout that used to be
+  `subprocess.run(timeout=300)` is now a wall-clock deadline checked every
+  `_drain()` iteration, since `Popen` has no equivalent for an incrementally
+  read stream. Only exercised on Unix - `select()` doesn't support pipes on
+  Windows, unverified there. `invoke()` gained an optional
+  `on_event: Callable[[dict], None]` param, called once per parsed event
+  before the final `"type":"result"` line is recognized - `codex_cli.invoke()`
+  and the `Provider` protocol (`base.py`) both accept the same param for
+  interface conformance, but `codex_cli.py` ignores it (still on
+  `--output-last-message`, not `--json`'s own JSONL stream - real, not-yet-done
+  work, same shape as this Claude-side change was before it was done).
+  `router.route_and_run()` gained a matching `on_event` passthrough plus a
+  separate `on_decision: Callable[[RouteDecision], None]`, fired the instant
+  `route()` resolves - before the provider call starts - specifically so a
+  caller can show routing info immediately rather than only once the full
+  response lands.
+- `tui.py` (new) is a stdlib-only ANSI styling module - ANSI escape codes,
+  not `rich`/`textual`, matching this repo's zero-dependency rule. It renders
+  in the visual spirit of Claude Code's own CLI (a colored provider bullet,
+  one-line tool-call summaries, a dim cost/duration footer, a transient
+  "thinking…" status cleared the moment real text starts) - deliberately not
+  a pixel-exact clone of a closed-source renderer, and not a pty (a raw pty
+  takeover was already considered and rejected for `llm-chat`, see above -
+  this doesn't revisit that). `repl.py`'s `chat_loop()` wires a
+  `tui.StreamRenderer` into `on_event` so the model's answer streams live,
+  token-by-token, instead of appearing all at once after the call returns;
+  `on_decision` prints the `[provider/model, tier=X]` header the moment
+  routing resolves. `chat_loop()` gained a `write_fn` param (default
+  `tui.default_write`, raw `sys.stdout.write`+`flush`) separate from
+  `print_fn` - `print_fn` still emits discrete, newline-terminated lines
+  (what tests assert on), `write_fn` emits raw unterminated chunks for live
+  streaming; collapsing these into one parameter would make either the
+  streamed text or the line-based assertions awkward to test. `format_response()`
+  is kept as the non-streaming full-message formatter (still the pinned text
+  contract in tests) but `chat_loop`'s success path no longer calls it -
+  doing so would print the answer a second time after it was already
+  streamed.
+
+**A mocking gap surfaced once, worth restating so it isn't repeated:**
+switching `invoke()` from `subprocess.run` to `subprocess.Popen` silently
+invalidated every existing test that patched `subprocess.run` - they kept
+"passing" their own mock setup while actually falling through to a real,
+unmocked `Popen` call. Caught by a bash-level timeout during development
+after ~15-20 real (cheap, haiku/sonnet, trivial-prompt) calls had already
+gone out - a real, if small, unintended cost, not a hypothetical one. Every
+`claude_cli.py` test now patches `subprocess.Popen` directly (`_FakeProcess`/
+`_FakeStream` doubles in `tests/test_claude_cli.py`) and asserts it, not just
+`subprocess.run`. Whenever this adapter's underlying subprocess call
+mechanism changes again, re-verify by running the single narrowest affected
+test first (with a hard timeout) before running the full suite - don't
+assume an existing green test file still means what it used to.
+
+**A static input box frame was tried and removed the same day (2026-07-27).**
+`chat_loop()` briefly printed a box-drawing top/bottom border around each
+`input_fn()` call, width-matched to the terminal via
+`shutil.get_terminal_size()`. Rejected once actually used: `input()` hands
+line editing to the terminal's own readline layer, which just overwrites/
+advances at the cursor as you type - so there's no way to keep a right
+border in place, and once typed text line-wraps in the terminal there's no
+border around the wrapped lines at all, since the frame was printed before
+input even started. A box that genuinely wraps around wrapped text needs
+raw terminal mode (`termios`/`tty`) and a hand-rolled line editor rebuilding
+backspace/arrows/history/resize-handling from scratch - evaluated and
+explicitly declined twice (once before building the static version, again
+after seeing its limits) as a substantially bigger build than everything
+else in this pass combined. `chat_loop()` is back to a plain styled
+`tui.prompt()` with no border.
 
 **Plan mode is explicitly deferred, not part of this pass.** A future
 seam - a two-turn flow, one call with `--permission-mode plan` to produce a

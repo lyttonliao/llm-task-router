@@ -54,6 +54,7 @@ exit) as unauthenticated too, rather than matching one exact string.
 
 import subprocess
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 
 from llm_task_router.schema import ProviderResult
@@ -87,7 +88,13 @@ def check_auth() -> tuple[bool, str]:
     return False, output or "not logged in - run `codex login`"
 
 
-def invoke(prompt: str, model: str, *, session_id: str | None = None) -> ProviderResult:
+def invoke(
+    prompt: str,
+    model: str,
+    *,
+    session_id: str | None = None,
+    on_event: Callable[[dict], None] | None = None,
+) -> ProviderResult:
     """session_id is accepted for Provider-protocol conformance but ignored:
     unlike `claude -p --session-id`/`--resume`, `codex exec` has no flag to
     pre-assign a session id up front (confirmed via `codex exec --help`) -
@@ -96,7 +103,16 @@ def invoke(prompt: str, model: str, *, session_id: str | None = None) -> Provide
     call. Wiring real Codex continuity would need callers to branch on "is
     this the first message" and call a different entry point - out of scope
     while no Codex model is even routable (tiers.TIER_MODELS is Claude-only,
-    see that module's docstring)."""
+    see that module's docstring).
+
+    on_event is likewise accepted-but-ignored, for the same Provider-protocol
+    conformance reason: this adapter uses `--output-last-message` (a single
+    file written at exit), not `--json`'s per-line event stream (see module
+    docstring's "NOT verified"/shape notes) - there is nothing to stream from
+    here yet. Wiring it would mean switching this adapter to parse `codex
+    exec --json`'s JSONL instead, which is a real, not-yet-done piece of
+    work, same as claude_cli.py's stream-json switch was - not worth doing
+    speculatively while no tier routes to Codex at all."""
     return _invoke_without_session(prompt, model)
 
 

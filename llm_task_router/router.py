@@ -10,6 +10,8 @@ the next cascade tier means giving classify() a confidence signal and falling
 through to it here, not replacing this function's shape.
 """
 
+from collections.abc import Callable
+
 from llm_task_router.classifier import classify, classify_description
 from llm_task_router.providers import claude_cli, codex_cli
 from llm_task_router.schema import ProviderResult, RouteDecision, TaskRequest
@@ -37,8 +39,21 @@ def route(request: TaskRequest) -> RouteDecision:
     )
 
 
-def route_and_run(request: TaskRequest) -> tuple[RouteDecision, ProviderResult]:
+def route_and_run(
+    request: TaskRequest,
+    *,
+    on_event: Callable[[dict], None] | None = None,
+    on_decision: Callable[[RouteDecision], None] | None = None,
+) -> tuple[RouteDecision, ProviderResult]:
+    """on_decision, if given, fires the moment routing resolves - before the
+    (potentially long) provider call starts - so a caller like repl.py can
+    print "routed to X" immediately instead of only after the full response
+    lands. on_event is forwarded straight into provider.invoke() for
+    per-event streaming (see claude_cli.py); providers that can't stream yet
+    (codex_cli.py) accept and ignore it."""
     decision = route(request)
+    if on_decision:
+        on_decision(decision)
     provider = PROVIDERS[decision.provider]
-    result = provider.invoke(request.description, decision.model, session_id=request.session_id)
+    result = provider.invoke(request.description, decision.model, session_id=request.session_id, on_event=on_event)
     return decision, result

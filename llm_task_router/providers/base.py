@@ -1,7 +1,15 @@
+from collections.abc import Callable
 from typing import Protocol
 
 from llm_task_router.schema import ProviderResult
 
 
 class Provider(Protocol):
-    def invoke(self, prompt: str, model: str, *, session_id: str | None = None) -> ProviderResult: ...
+    def invoke(
+        self,
+        prompt: str,
+        model: str,
+        *,
+        session_id: str | None = None,
+        on_event: Callable[[dict], None] | None = None,
+    ) -> ProviderResult: ...

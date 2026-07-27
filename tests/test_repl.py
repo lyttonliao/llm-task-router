@@ -170,12 +170,19 @@ def test_format_response_success_includes_model_indicator_and_verbatim_text_and_
 
 
 def test_format_response_error_path_omits_text_and_cost_shows_error():
+    """Not an exact-equality check anymore: format_response wraps the header
+    and error text in ANSI color codes (see tui.py) as of the 2026-07-27
+    styling pass, so this asserts on substance (single line, no stray cost
+    footer, error text present) rather than a byte-exact string."""
     decision = RouteDecision(tier="cheap", provider="claude", model="haiku", reason="r")
     result = ProviderResult(text="", cost_usd=0.0, duration_ms=0, error="auth check failed: not logged in")
 
     out = format_response(decision, result)
 
-    assert out == "[claude/haiku, tier=cheap] error: auth check failed: not logged in"
+    assert "[claude/haiku, tier=cheap]" in out
+    assert "error: auth check failed: not logged in" in out
+    assert "\n" not in out
+    assert "cost $" not in out
 
 
 # --- chat_loop ---
@@ -235,6 +242,67 @@ def test_chat_loop_reuses_same_session_id_across_messages():
     (request_2,), _ = mock_route.call_args_list[1]
     assert uuid.UUID(request_1.session_id)
     assert request_1.session_id == request_2.session_id
+
+
+def test_chat_loop_prints_header_via_on_decision_before_result_is_known():
+    """The header must come from on_decision (fired the instant routing
+    resolves), not from the final result - route_and_run is faked here to
+    invoke on_decision itself, mirroring what the real function does before
+    the (potentially long) provider call starts."""
+    decision = RouteDecision(tier="flagship", provider="claude", model="opus", reason="r")
+    result = ProviderResult(text="hi", cost_usd=0.001, duration_ms=100)
+
+    def fake_route_and_run(request, *, on_event=None, on_decision=None):
+        on_decision(decision)
+        return decision, result
+
+    print_fn = Mock()
+    with patch("llm_task_router.repl.route_and_run", side_effect=fake_route_and_run):
+        chat_loop(input_fn=Mock(side_effect=["fix the bug", "/exit"]), print_fn=print_fn, write_fn=lambda t: None)
+
+    assert any("claude/opus" in str(call) and "flagship" in str(call) for call in print_fn.call_args_list)
+
+
+def test_chat_loop_streams_body_via_write_fn_and_does_not_reprint_it_via_print_fn():
+    """The whole point of streaming: result.text must not be printed a
+    second time via print_fn once it was already streamed live through
+    write_fn."""
+    decision = RouteDecision(tier="cheap", provider="claude", model="haiku", reason="r")
+    result = ProviderResult(text="streamed answer", cost_usd=0.001, duration_ms=100)
+    written = []
+
+    def fake_route_and_run(request, *, on_event=None, on_decision=None):
+        on_event(
+            {
+                "type": "stream_event",
+                "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "streamed answer"}},
+            }
+        )
+        return decision, result
+
+    print_fn = Mock()
+    with patch("llm_task_router.repl.route_and_run", side_effect=fake_route_and_run):
+        chat_loop(input_fn=Mock(side_effect=["fix the bug", "/exit"]), print_fn=print_fn, write_fn=written.append)
+
+    assert "".join(written) == "streamed answer\n"  # renderer.finish() appends the trailing newline
+    assert not any("streamed answer" in str(call) for call in print_fn.call_args_list)
+    assert any("$0.0010" in str(call) or "0.0010" in str(call) for call in print_fn.call_args_list)
+
+
+def test_chat_loop_error_path_prints_error_not_footer():
+    decision = RouteDecision(tier="cheap", provider="claude", model="haiku", reason="r")
+    result = ProviderResult(text="", cost_usd=0.0, duration_ms=0, error="auth check failed: not logged in")
+
+    def fake_route_and_run(request, *, on_event=None, on_decision=None):
+        on_decision(decision)
+        return decision, result
+
+    print_fn = Mock()
+    with patch("llm_task_router.repl.route_and_run", side_effect=fake_route_and_run):
+        chat_loop(input_fn=Mock(side_effect=["fix the bug", "/exit"]), print_fn=print_fn, write_fn=lambda t: None)
+
+    assert any("error: auth check failed: not logged in" in str(call) for call in print_fn.call_args_list)
+    assert not any("cost $" in str(call) for call in print_fn.call_args_list)
 
 
 def test_chat_loop_unknown_slash_command_prints_message_and_continues_loop():
