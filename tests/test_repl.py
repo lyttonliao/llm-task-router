@@ -1,3 +1,4 @@
+import uuid
 from unittest.mock import Mock, patch
 
 import pytest
@@ -11,7 +12,7 @@ from llm_task_router.repl import (
     routable_tiers,
     startup_auth_check,
 )
-from llm_task_router.schema import ProviderResult, RouteDecision, TaskRequest
+from llm_task_router.schema import ProviderResult, RouteDecision
 from llm_task_router.tiers import TIER_MODELS
 
 
@@ -213,7 +214,27 @@ def test_chat_loop_routes_plain_message_via_route_and_run():
 
     mock_route.assert_called_once()
     (request,), _ = mock_route.call_args
-    assert request == TaskRequest(description="fix the bug", task_type=None, domain=None)
+    assert request.description == "fix the bug"
+    assert request.task_type is None
+    assert request.domain is None
+    assert uuid.UUID(request.session_id)  # a real UUID string, not raising
+
+
+def test_chat_loop_reuses_same_session_id_across_messages():
+    """session_id is generated once per chat_loop() run, not per message -
+    the whole point of threading it through is that conversation history
+    continues even as different messages route to different tiers."""
+    decision = RouteDecision(tier="cheap", provider="claude", model="haiku", reason="r")
+    result = ProviderResult(text="hi", cost_usd=0.001, duration_ms=100)
+
+    with patch("llm_task_router.repl.route_and_run", return_value=(decision, result)) as mock_route:
+        chat_loop(input_fn=Mock(side_effect=["first", "second", "/exit"]), print_fn=lambda *a: None)
+
+    assert mock_route.call_count == 2
+    (request_1,), _ = mock_route.call_args_list[0]
+    (request_2,), _ = mock_route.call_args_list[1]
+    assert uuid.UUID(request_1.session_id)
+    assert request_1.session_id == request_2.session_id
 
 
 def test_chat_loop_unknown_slash_command_prints_message_and_continues_loop():

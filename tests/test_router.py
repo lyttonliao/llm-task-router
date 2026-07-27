@@ -38,6 +38,18 @@ def test_route_and_run_invokes_resolved_provider():
     with patch("llm_task_router.router.claude_cli.invoke", return_value=fake_result) as mock_invoke:
         decision, result = route_and_run(request)
 
-    mock_invoke.assert_called_once_with("summarize this report", "haiku")
+    mock_invoke.assert_called_once_with("summarize this report", "haiku", session_id=None)
     assert decision.tier == "cheap"
     assert result is fake_result
+
+
+def test_route_and_run_threads_session_id_through_to_invoke():
+    request = TaskRequest(
+        description="summarize this report", task_type="summarization", domain="other", session_id="fixed-uuid"
+    )
+    fake_result = ProviderResult(text="summary here", cost_usd=0.001, duration_ms=200)
+
+    with patch("llm_task_router.router.claude_cli.invoke", return_value=fake_result) as mock_invoke:
+        route_and_run(request)
+
+    mock_invoke.assert_called_once_with("summarize this report", "haiku", session_id="fixed-uuid")

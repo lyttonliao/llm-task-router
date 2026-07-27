@@ -40,5 +40,5 @@ def route(request: TaskRequest) -> RouteDecision:
 def route_and_run(request: TaskRequest) -> tuple[RouteDecision, ProviderResult]:
     decision = route(request)
     provider = PROVIDERS[decision.provider]
-    result = provider.invoke(request.description, decision.model)
+    result = provider.invoke(request.description, decision.model, session_id=request.session_id)
     return decision, result

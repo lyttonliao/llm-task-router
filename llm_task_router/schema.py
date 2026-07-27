@@ -19,6 +19,8 @@ class TaskRequest:
     description: str
     task_type: str | None = None  # one of TASK_TYPES; inferred when omitted
     domain: str | None = None  # one of DOMAINS; inferred when omitted
+    session_id: str | None = None  # pins/continues a claude -p conversation across
+    # messages; None means no continuity. See CLAUDE.md, "llm-chat".
 
 
 @dataclass(frozen=True)

@@ -128,21 +128,72 @@ their existing Claude/ChatGPT subscriptions - no code path here touches
 `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`, matching this repo's "subscription
 CLIs, not API keys" rationale.
 
-**Stateless, single-shot per message, deliberately, for v1.** Every message
-in a session routes independently through `route_and_run()` completely
-unmodified - no conversation history is sent to the model, and a session
-can land a different message on a different model/tier with zero special
-handling. This is a real limitation, not an oversight: both `claude -p` and
-`codex exec` already expose session-continuation flags (`--session-id`/
-`--continue`/`--resume` and `codex exec resume` respectively) that a v2
-could use. The seam for that: `TaskRequest` could gain an optional
-`session_id: str | None = None` field (backward-compatible default), and
-provider `invoke()` could gain an optional continuation kwarg mapping to
-those flags. None of this exists yet - it's a seam, not a partial
-implementation, and multi-turn continuity has a real complication worth
-solving deliberately rather than bolting on: switching which provider/tier
-a message routes to mid-conversation breaks continuity, since each CLI's
-session state is local to that CLI.
+**Session continuity, implemented 2026-07-26.** `TaskRequest.session_id` is
+generated once per `chat_loop()` run (not per message) and threaded through
+`route_and_run()` -> `provider.invoke(..., session_id=...)` unconditionally,
+even when `None`. Every message in one `llm-chat` session shares the same
+`session_id`, so conversation history continues even as the classifier
+routes different messages to different Claude tiers/models mid-session -
+built specifically so `llm-chat` could stay a thin router in front of real
+Claude Code functionality (tools, real system prompt, CLAUDE.md/hooks, and
+eventually plan mode) instead of reimplementing an interface that mimics it.
+Two designs were considered and rejected first: a bespoke chat interface
+that reimplements CLI functionality (drifts from upstream, throws away
+plan mode/slash commands for free), and a raw PTY takeover of a live
+interactive `claude` session injecting `/model` mid-session (undocumented,
+unconfirmed, more fragile than the mechanism below).
+
+**The real mechanism, confirmed against real `claude` 2.1.220 output on
+2026-07-26 (not guessed) - see the verification commands in
+`providers/claude_cli.py`'s module docstring:**
+```bash
+claude -p "Remember this: my favorite fruit is starfruit. Just say OK." \
+  --model haiku --session-id "$SID" --output-format json      # establishes the session
+
+claude -p "What did I say my favorite fruit was?" \
+  --resume "$SID" --model sonnet --output-format json         # -> "Starfruit."
+```
+Reusing `--session-id` on a second call FAILS outright ("Session ID ... is
+already in use") - the correct flag for every call after the first is
+`--resume`, and it does correctly continue history across a `--model`
+change. `claude_cli.py` tracks which session ids have already had their
+establishing call in a module-level `_established_sessions` set (only added
+after a confirmed success, not on error/timeout) so callers never need to
+know or care which flag a given call becomes - they just pass the same
+`session_id` every time.
+
+**Full functionality, not cost-minimized - a deliberate choice, distinct
+from `llm-eval-harness`'s adapter.** `llm-chat` is a real interactive
+client, not an offline benchmarking harness, so `providers/claude_cli.py`
+no longer strips the system prompt or disables tools/MCP the way
+`eval_harness/claude_cli.py` does - real tools, real system prompt, real
+CLAUDE.md/hooks all work, at the real per-call cost that comes with that
+(~$0.07-0.30/call observed here, vs. ~$0.003-0.005/call stripped). Tool
+calls run under `--permission-mode bypassPermissions` since a headless
+`subprocess.run()` call has no TTY to show an approval prompt - confirmed
+against real output to execute real commands (`pwd`) with zero approval
+prompts (`permission_denials: []`). This only touches this repo's own,
+independent `claude_cli.py` - `llm-eval-harness` has its own separate copy
+(see "Independent from `llm-eval-harness`" above), so there's no cross-repo
+cost or behavior change. Timeout bumped from 60s to 300s to accommodate real
+tool-use turns instead of stripped single completions.
+
+**Still true, still unsolved:** cross-provider mid-conversation continuity.
+`codex_cli.invoke` accepts `session_id` for `Provider`-protocol conformance
+but ignores it entirely (`codex exec` has no flag to pre-assign a session id
+- confirmed via `codex exec --help` - continuation there is the separate
+`codex exec resume <id>` subcommand). This only works today because every
+tier in `tiers.TIER_MODELS` maps to Claude - switching which provider a
+message routes to mid-conversation would still break continuity, since each
+CLI's session state is local to that CLI. Constraining this feature to
+Claude-only wasn't a new limitation introduced by this change - it formalizes
+what was already true.
+
+**Plan mode is explicitly deferred, not part of this pass.** A future
+seam - a two-turn flow, one call with `--permission-mode plan` to produce a
+plan, a follow-up call in the same session (via `--resume`) to approve/
+execute it - noted here the same way multi-turn continuity was noted before
+it was implemented, not designed further until it's actually needed.
 
 **Login is always handed off to the provider's own interactive command,
 never driven programmatically.** `claude_cli.login()` and `codex_cli.login()`
@@ -262,10 +313,13 @@ the point is failing fast and consistently, not just failing.
   tested clears haiku's floor yet, so the map stays Claude-only for now - see
   the calibration status section in that repo's CLAUDE.md for the full table
   and which Codex model slugs are even reachable on this account.
-- Whether task types like `code_gen`/`refactor` should eventually get real
-  tool access (vs. the current single-shot, tools-disabled completion every
-  provider call makes) is an open, deliberately deferred question - see the
-  cost-guardrail flags in `claude_cli.py`.
+- Tool access is resolved for every Claude call, not just `llm-chat`'s -
+  `providers/claude_cli.py` no longer disables tools by default (see
+  "llm-chat: interactive terminal client" above), and `llm-route`'s one-shot
+  CLI path goes through the same `claude_cli.invoke()`, so it shares the same
+  full-functionality/`bypassPermissions` behavior. Confirmed deliberately
+  with the user (2026-07-26), not an accidental side effect: one adapter, one
+  behavior, rather than threading a cost-mode flag through both call paths.
 - No shadow evaluation, no live dual-routing, no drift auditing - this
   scaffold only exploits the current heuristic grid, it doesn't explore or
   self-correct yet.

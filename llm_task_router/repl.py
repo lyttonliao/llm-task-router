@@ -1,13 +1,15 @@
 """Interactive terminal chat client. Authenticates once per provider at
 startup (offering to run each provider's own login command interactively),
-then routes each message independently through router.route_and_run() -
-stateless, single-shot, no conversation history sent to the model. See
-CLAUDE.md, "llm-chat: interactive terminal client" for the v2 multi-turn
-seam (claude -p --session-id/--continue/--resume, codex exec resume) this
-deliberately does not wire up.
+then routes each message through router.route_and_run(). Every message in a
+chat_loop() run shares one session_id, so conversation history continues
+across messages even as the classifier routes different messages to
+different Claude tiers/models - see CLAUDE.md, "llm-chat: interactive
+terminal client" for the real-CLI verification this rests on and for why
+cross-provider continuity (Codex) isn't part of this.
 """
 
 import sys
+import uuid
 
 from llm_task_router.known_models import known_models_for
 from llm_task_router.router import PROVIDERS, route_and_run
@@ -120,12 +122,16 @@ def format_response(decision, result) -> str:
 
 
 def chat_loop(*, input_fn=input, print_fn=print) -> None:
-    """Stateless, single-shot per message - every line is routed
-    independently via route_and_run() with no conversation history. A
-    message that routes to a provider the user skipped at login needs no
-    special handling here: invoke() already runs its own check_auth() first,
-    so it naturally comes back as ProviderResult(error="auth check failed:
-    ..."), which flows through format_response()'s normal error path."""
+    """One session_id, generated once here (not per message), is attached to
+    every TaskRequest built in this loop - route_and_run() -> claude_cli.invoke()
+    turns that into --session-id on the first call and --resume on every call
+    after, so conversation history continues even as the classifier sends
+    different messages to different Claude tiers. A message that routes to a
+    provider the user skipped at login needs no special handling here:
+    invoke() already runs its own check_auth() first, so it naturally comes
+    back as ProviderResult(error="auth check failed: ..."), which flows
+    through format_response()'s normal error path."""
+    session_id = str(uuid.uuid4())
     while True:
         try:
             line = input_fn("you> ")
@@ -146,7 +152,7 @@ def chat_loop(*, input_fn=input, print_fn=print) -> None:
             print_fn(f"unknown command: {line} (try /help)")
             continue
 
-        request = TaskRequest(description=line)
+        request = TaskRequest(description=line, session_id=session_id)
         try:
             decision, result = route_and_run(request)
         except Exception as exc:

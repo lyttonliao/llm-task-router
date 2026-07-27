@@ -87,7 +87,20 @@ def check_auth() -> tuple[bool, str]:
     return False, output or "not logged in - run `codex login`"
 
 
-def invoke(prompt: str, model: str) -> ProviderResult:
+def invoke(prompt: str, model: str, *, session_id: str | None = None) -> ProviderResult:
+    """session_id is accepted for Provider-protocol conformance but ignored:
+    unlike `claude -p --session-id`/`--resume`, `codex exec` has no flag to
+    pre-assign a session id up front (confirmed via `codex exec --help`) -
+    Codex allocates its own id on first run, and continuing one is the
+    separate `codex exec resume <id> <prompt>` subcommand, not a flag on this
+    call. Wiring real Codex continuity would need callers to branch on "is
+    this the first message" and call a different entry point - out of scope
+    while no Codex model is even routable (tiers.TIER_MODELS is Claude-only,
+    see that module's docstring)."""
+    return _invoke_without_session(prompt, model)
+
+
+def _invoke_without_session(prompt: str, model: str) -> ProviderResult:
     authenticated, auth_error = check_auth()
     if not authenticated:
         return ProviderResult(text="", cost_usd=0.0, duration_ms=0, error=f"auth check failed: {auth_error}")

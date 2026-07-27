@@ -185,6 +185,21 @@ def test_missing_output_file_returns_empty_text():
     assert result.error == ""
 
 
+def test_invoke_accepts_and_ignores_session_id():
+    """codex exec has no flag to pre-assign a session id (confirmed via
+    `codex exec --help`) - session_id is accepted only for Provider-protocol
+    conformance and must never leak into the built command."""
+    with patch(
+        "llm_task_router.providers.codex_cli.subprocess.run",
+        side_effect=_with_auth_ok(lambda cmd, **kwargs: _completed()),
+    ) as mock_run:
+        result = invoke("do the task", model="gpt-5", session_id="some-uuid")
+
+    assert result.error == ""
+    cmd = mock_run.call_args_list[1][0][0]
+    assert "some-uuid" not in cmd
+
+
 def test_invalid_model_name_returns_error_from_real_observed_failure_shape():
     """Regression guard for a real failure seen against a live account:
     an unsupported model name gets a non-zero exit and no output file, with

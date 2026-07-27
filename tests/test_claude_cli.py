@@ -2,6 +2,7 @@ import json
 import subprocess
 from unittest.mock import patch
 
+from llm_task_router.providers import claude_cli as claude_cli_module
 from llm_task_router.providers.claude_cli import check_auth, invoke, login
 
 
@@ -101,11 +102,14 @@ def test_invoke_short_circuits_and_never_calls_model_when_not_authenticated():
     assert mock_run.call_count == 1  # only the auth check, never the real -p call
 
 
-def test_builds_expected_command_with_cost_guardrail_flags():
-    """--disallowed-tools "*" and --strict-mcp-config strip the default Claude
-    Code system prompt - a regression here silently reintroduces the ~$0.07/call
-    cost this adapter exists to avoid. Assert the exact command list, not just
-    that subprocess.run was called."""
+def test_builds_expected_command_without_cost_guardrail_flags_by_default():
+    """Full-functionality adapter, not cost-minimized: no --disallowed-tools,
+    no --strict-mcp-config, no unconditional --system-prompt "" - a real
+    interactive client wants real tools/system-prompt/CLAUDE.md, unlike
+    llm-eval-harness's stripped-down adapter. Tools instead run under
+    --permission-mode bypassPermissions since there's no TTY here to show an
+    approval prompt. Assert the exact command list, not just that
+    subprocess.run was called."""
     payload = json.dumps({"result": "ok", "total_cost_usd": 0.001, "duration_ms": 500})
     with patch(
         "llm_task_router.providers.claude_cli.subprocess.run",
@@ -119,19 +123,90 @@ def test_builds_expected_command_with_cost_guardrail_flags():
         "claude",
         "-p",
         "do the task",
-        "--system-prompt",
-        "",
-        "--disallowed-tools",
-        "*",
-        "--strict-mcp-config",
         "--model",
         "haiku",
         "--output-format",
         "json",
+        "--permission-mode",
+        "bypassPermissions",
     ]
     assert kwargs["capture_output"] is True
     assert kwargs["text"] is True
-    assert kwargs["timeout"] == 60
+    assert kwargs["timeout"] == 300
+
+
+def test_invoke_omits_session_flags_when_session_id_not_provided():
+    payload = json.dumps({"result": "ok", "total_cost_usd": 0.001, "duration_ms": 500})
+    with patch(
+        "llm_task_router.providers.claude_cli.subprocess.run",
+        side_effect=[_auth_ok(), _completed(stdout=payload)],
+    ) as mock_run:
+        invoke("do the task", model="haiku")
+
+    cmd = mock_run.call_args_list[1][0][0]
+    assert "--session-id" not in cmd
+    assert "--resume" not in cmd
+
+
+def test_invoke_includes_session_id_flag_on_first_call():
+    claude_cli_module._established_sessions.discard("sid-first")
+    payload = json.dumps({"result": "ok", "total_cost_usd": 0.001, "duration_ms": 500})
+    with patch(
+        "llm_task_router.providers.claude_cli.subprocess.run",
+        side_effect=[_auth_ok(), _completed(stdout=payload)],
+    ) as mock_run:
+        invoke("do the task", model="haiku", session_id="sid-first")
+
+    cmd = mock_run.call_args_list[1][0][0]
+    assert "--session-id" in cmd
+    assert cmd[cmd.index("--session-id") + 1] == "sid-first"
+    assert "--resume" not in cmd
+    assert "sid-first" in claude_cli_module._established_sessions
+    claude_cli_module._established_sessions.discard("sid-first")
+
+
+def test_invoke_uses_resume_flag_once_session_already_established():
+    """Confirmed against real `claude` output (2026-07-26): reusing
+    --session-id on a second call FAILS ("Session ID ... is already in
+    use"); --resume is the correct flag for every call after the first, and
+    it does continue the conversation under a different --model."""
+    claude_cli_module._established_sessions.add("sid-second")
+    payload = json.dumps({"result": "ok", "total_cost_usd": 0.001, "duration_ms": 500})
+    with patch(
+        "llm_task_router.providers.claude_cli.subprocess.run",
+        side_effect=[_auth_ok(), _completed(stdout=payload)],
+    ) as mock_run:
+        invoke("do the task", model="sonnet", session_id="sid-second")
+
+    cmd = mock_run.call_args_list[1][0][0]
+    assert "--resume" in cmd
+    assert cmd[cmd.index("--resume") + 1] == "sid-second"
+    assert "--session-id" not in cmd
+    claude_cli_module._established_sessions.discard("sid-second")
+
+
+def test_invoke_does_not_mark_session_established_when_call_fails():
+    claude_cli_module._established_sessions.discard("sid-fail")
+    with patch(
+        "llm_task_router.providers.claude_cli.subprocess.run",
+        side_effect=[_auth_ok(), _completed(returncode=1, stderr="boom")],
+    ):
+        invoke("do the task", model="haiku", session_id="sid-fail")
+
+    assert "sid-fail" not in claude_cli_module._established_sessions
+
+
+def test_invoke_includes_system_prompt_only_when_explicitly_set():
+    payload = json.dumps({"result": "ok", "total_cost_usd": 0.001, "duration_ms": 500})
+    with patch(
+        "llm_task_router.providers.claude_cli.subprocess.run",
+        side_effect=[_auth_ok(), _completed(stdout=payload)],
+    ) as mock_run:
+        invoke("do the task", model="haiku", system_prompt="be terse")
+
+    cmd = mock_run.call_args_list[1][0][0]
+    assert "--system-prompt" in cmd
+    assert cmd[cmd.index("--system-prompt") + 1] == "be terse"
 
 
 def test_success_path_parses_cost_duration_and_result():
@@ -162,12 +237,12 @@ def test_nonzero_exit_code_returns_error_from_stderr():
 def test_timeout_expired_returns_timeout_error():
     with patch(
         "llm_task_router.providers.claude_cli.subprocess.run",
-        side_effect=[_auth_ok(), subprocess.TimeoutExpired(cmd=["claude"], timeout=60)],
+        side_effect=[_auth_ok(), subprocess.TimeoutExpired(cmd=["claude"], timeout=300)],
     ):
         result = invoke("do the task", model="haiku")
 
     assert result.error == "timeout"
-    assert result.duration_ms == 60_000
+    assert result.duration_ms == 300_000
 
 
 def test_stdout_not_valid_json_returns_parse_error():
