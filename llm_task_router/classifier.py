@@ -49,6 +49,64 @@ DOMAIN_KEYWORDS: dict[str, tuple[str, ...]] = {
     "other": (),
 }
 
+# Signals that a request is genuinely high-stakes - production impact,
+# security/compliance exposure, irreversibility, meaningful scale - as
+# opposed to merely matching an H-mapped type/domain's *shape* keywords.
+# Added 2026-07-27 because TYPE_KEYWORDS' architecture row ("design",
+# "strategy") is loose enough to fire on a trivial question ("what's a good
+# design for this button?") with the same weight as a real one ("design the
+# multi-region disaster recovery strategy for the payment system") - shape
+# alone isn't evidence of difficulty, consequence, or ambiguity. See
+# router.route()'s docstring for how this gates flagship.
+#
+# Deliberately narrow and NOT exhaustive - this is a coarse keyword net, the
+# same kind of imprecise instrument TYPE_KEYWORDS/DOMAIN_KEYWORDS already
+# are, and will have false negatives on real high-stakes asks that don't
+# happen to use one of these exact phrases (e.g. "migrate the k8s cluster to
+# a new region" with no "multi-region"/"disaster recovery" wording). That is
+# an accepted tradeoff, not an oversight: closing this gap for real needs
+# tier 2/3 of the confidence cascade (a trained model or a cheap-LLM
+# judgment call, see router.py's module docstring), not a longer guessed
+# keyword list - widen this against real routing decisions that turned out
+# wrong, not speculation, same discipline llm-eval-harness's CLAUDE.md
+# documents for phrase-group widening generally.
+IMPACT_KEYWORDS: tuple[str, ...] = (
+    "production",
+    "customer data",
+    "customers'",
+    "compliance",
+    "regulatory",
+    "regulation",
+    "gdpr",
+    "hipaa",
+    "pci",
+    "security",
+    "vulnerability",
+    "breach",
+    "irreversible",
+    "data loss",
+    "outage",
+    "downtime",
+    "disaster recovery",
+    "high availability",
+    "multi-region",
+    "distributed system",
+    "at scale",
+    "millions of users",
+    "financial",
+    "payment",
+    "pii",
+    "breaking change",
+    "sla",
+    "mission-critical",
+    "safety-critical",
+)
+
+
+def has_high_stakes_signal(description: str) -> bool:
+    normalized = description.lower()
+    return any(keyword in normalized for keyword in IMPACT_KEYWORDS)
+
 
 def classify(task_type: str, domain: str) -> str:
     if task_type not in TASK_TYPES:

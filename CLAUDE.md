@@ -60,9 +60,50 @@ The full design (from the router planning thread) is a confidence cascade:
    labels, for cases the heuristic doesn't confidently cover. Not built.
 3. A **cheap LLM call** for the remaining ambiguity band. Not built.
 
-Default-to-escalate under uncertainty, not default-to-cheap - an
-underrouted, silently-wrong answer is worse than an overrouted, correct-but-
-pricier one, because the former is undetectable without dedicated auditing.
+~~Default-to-escalate under uncertainty, not default-to-cheap~~ - **superseded
+2026-07-27, see below.** This was the original principle (an underrouted,
+silently-wrong answer is worse than an overrouted, correct-but-pricier one,
+because the former is undetectable without dedicated auditing) and it drove
+two fixes made the same day, in this order, before it was corrected outright:
+
+1. **Fix 1 - no-signal fallback.** `classify_description()`'s
+   fully-unrecognized description falls back to `task_type="architecture"`
+   purely so `classify()` always has a valid grid key (see that function's
+   docstring) - that label is not evidence the task is architecture-shaped.
+   Feeding it straight into the grid meant "we have zero idea what this is"
+   silently became "escalate to flagship", since `architecture`'s row is
+   uniform `H`. A trivial toy prompt with no keyword overlap on either axis
+   ("reply with exactly the word: pong") routed to opus and cost ~$0.18 to
+   repeat one word. Fixed by hedging at `mid` when **both** axes are fully
+   unresolved, instead of consulting the grid.
+2. **Fix 2 (this superseded the "escalate under uncertainty" framing
+   entirely) - flagship needs a real high-stakes signal, not just a shape
+   match.** Fix 1 wasn't narrow enough: an *inferred* type/domain match
+   still reached the grid's `H` cells on shape alone - `architecture`'s
+   `TYPE_KEYWORDS` include bare words like `"design"`/`"strategy"`, which
+   match a trivial question ("what's a good design for this button?")
+   exactly as readily as a real one ("design the multi-region disaster
+   recovery strategy for the payment system"). `router.route()` now requires
+   **both** an H-mapped grid cell **and** (unless the caller explicitly
+   provided that `task_type` - an explicit override is trusted as a
+   deliberate judgment call, not second-guessed) a genuine high-stakes
+   signal in the description itself
+   (`classifier.has_high_stakes_signal()` - production/security/compliance/
+   irreversibility/scale vocabulary, see `IMPACT_KEYWORDS`'s docstring for
+   the full list and why it's deliberately narrow). An inferred `H` without
+   that corroboration is capped at `mid`.
+
+**The net effect: escalation to flagship is now precision-first, not
+recall-first** - the opposite bias from the original principle above. This
+is a real, accepted tradeoff: a genuinely hard task that doesn't happen to
+use recognized high-stakes vocabulary (e.g. "migrate the k8s cluster to a
+new region" - no "multi-region"/"disaster recovery" wording) will now be
+underrouted to `mid` rather than reaching flagship. That's the documented
+cost of not having tier 2/3 of the cascade below built yet - closing it for
+real needs the trained model or cheap-LLM-judgment tier, not a longer
+guessed keyword list (same "widen against real output, not speculation"
+discipline `llm-eval-harness`'s CLAUDE.md documents for phrase-group
+widening generally).
 
 Adding tier 2 or 3 means giving `classifier.classify()` a confidence signal
 and having `router.route()` fall through to the next tier when it's low -

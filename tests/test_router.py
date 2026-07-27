@@ -31,6 +31,73 @@ def test_route_infers_metadata_when_caller_omits_it():
     assert "type inferred" in decision.reason
 
 
+def test_route_caps_inferred_architecture_keywords_at_mid_without_high_stakes_signal():
+    """Superseded 2026-07-27: an *inferred* architecture-shape match ("design",
+    "scalable", "fault-tolerant") used to escalate to flagship on shape alone.
+    That's too broad - the same "design" keyword fires just as readily on a
+    trivial question. Without a genuine high-stakes signal (production/
+    security/compliance/irreversibility/scale vocabulary) in the description,
+    this is now capped at mid, not flagship."""
+    request = TaskRequest(description="design a scalable, fault-tolerant system for this workload")
+    decision = route(request)
+
+    assert decision.tier == "mid"
+    assert decision.model == "sonnet"
+    assert "no high-stakes signal" in decision.reason
+
+
+def test_route_escalates_inferred_architecture_to_flagship_with_high_stakes_signal():
+    """A real high-stakes signal (compliance + payment processing) alongside
+    an inferred architecture-shape match is what should actually earn
+    flagship - not the shape keyword alone."""
+    request = TaskRequest(
+        description="design the multi-region disaster recovery strategy for our payment processing system, "
+        "given a strict compliance requirement"
+    )
+    decision = route(request)
+
+    assert decision.tier == "flagship"
+    assert decision.model == "opus"
+
+
+def test_route_does_not_second_guess_an_explicit_caller_provided_type():
+    """A caller-provided task_type="architecture" is a deliberate override,
+    not a heuristic guess - it's trusted as-is and not gated behind a
+    high-stakes keyword check the way an inferred match is."""
+    request = TaskRequest(description="design a small internal tool", task_type="architecture", domain="backend")
+    decision = route(request)
+
+    assert decision.tier == "flagship"
+    assert decision.model == "opus"
+
+
+def test_route_hedges_to_mid_not_flagship_when_no_keyword_signal_on_either_axis():
+    """Regression guard for a real incident: a trivial toy prompt with zero
+    keyword overlap on either axis ("reply with exactly the word: pong")
+    used to silently inherit architecture's uniform-H row via
+    classify_description()'s label-only fallback, routing a $0.0002 task to
+    opus at real cost (~$0.18 observed). Total absence of signal must hedge
+    at mid, not flagship - flagship is earned by an actual signal, not
+    awarded to "we don't know"."""
+    request = TaskRequest(description="reply with exactly the word: pong")
+    decision = route(request)
+
+    assert decision.tier == "mid"
+    assert decision.model == "sonnet"
+    assert "no keyword signal" in decision.reason
+
+
+def test_route_uses_grid_normally_when_only_domain_axis_is_unresolved():
+    """One resolved axis (a real task_type keyword match) is enough real
+    signal to consult the grid normally, even if domain falls back to
+    "other" - this is not the no-signal case."""
+    request = TaskRequest(description="refactor this messy function")
+    decision = route(request)
+
+    assert decision.tier == "cheap"  # refactor x other = L, per the calibration-derived uniform-L row
+    assert "heuristic grid" in decision.reason
+
+
 def test_route_and_run_invokes_resolved_provider():
     request = TaskRequest(description="summarize this report", task_type="summarization", domain="other")
     fake_result = ProviderResult(text="summary here", cost_usd=0.001, duration_ms=200)

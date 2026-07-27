@@ -1,6 +1,6 @@
 import pytest
 
-from llm_task_router.classifier import TYPE_DOMAIN_GRID, classify, classify_description
+from llm_task_router.classifier import TYPE_DOMAIN_GRID, classify, classify_description, has_high_stakes_signal
 from llm_task_router.schema import DOMAINS, TASK_TYPES
 
 
@@ -53,6 +53,20 @@ def test_classify_description_escalates_unknown_task_shape():
     assert classification.domain == "other"
     assert classification.task_type_source == "fallback"
     assert classification.domain_source == "fallback"
+
+
+def test_has_high_stakes_signal_true_for_compliance_and_scale_vocabulary():
+    assert has_high_stakes_signal("this touches customer data and has a strict compliance requirement")
+    assert has_high_stakes_signal("we need multi-region disaster recovery for this")
+    assert has_high_stakes_signal("a production outage would mean real downtime for customers")
+
+
+def test_has_high_stakes_signal_false_for_generic_shape_words_alone():
+    """The whole point of this gate: "design"/"scalable"/"fault-tolerant"
+    alone are shape words, not stakes words - a trivial question can use
+    them just as readily as a real one."""
+    assert not has_high_stakes_signal("design a scalable, fault-tolerant system for this workload")
+    assert not has_high_stakes_signal("what's a good design for this button component?")
 
 
 def test_classify_description_honors_caller_overrides():
