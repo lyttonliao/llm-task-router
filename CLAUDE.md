@@ -44,12 +44,19 @@ llm_task_router/
                     (see rough edges below for what's still unverified)
   classifier.py   - tier-1 heuristic rule table (type x domain grid)
   embeddings.py   - tier-2: local sentence-transformers embedding wrapper
-  vector_store.py - tier-2: the only module with SQL - pgvector-backed
-                    routing_examples store (nearest_neighbors/insert_example)
+  vector_store.py - tier-2: pgvector-backed routing_examples store
+                    (nearest_neighbors/insert_example/all_labeled_examples) -
+                    one of two modules allowed to contain SQL, see
+                    decision_log.py below
   tier2_classifier.py - tier-2 orchestration: NN lookup + cheap-LLM
                     fallback-with-write-back (see "Tier 2: the
                     continuous-learning classifier" below)
-  db/schema.sql   - routing_examples DDL, applied manually via psql
+  decision_log.py - drift auditing: the second (and, for now, final) module
+                    allowed to contain SQL - write-only routing_decisions
+                    log, one row per route() call (see "Drift auditing:
+                    logging every routing decision" below)
+  db/schema.sql   - routing_examples + routing_decisions DDL, applied
+                    manually via psql
   tiers.py        - tier name -> concrete (provider, model) mapping
   known_models.py - static known-model table, display-only, NOT used for
                     routing (see "llm-chat" below)
@@ -254,6 +261,82 @@ back on any failure** - provider error, unparseable text, or a raised
 exception - same discipline `_classify_via_llm()` already established for
 tier 3's no-signal band. `router.py` treats tier-2-unavailable as "fall back
 to the existing heuristic-only behavior," never as a crash.
+
+**`resolve_high_stakes()` gained a `source` field, 2026-07-28** -
+`HighStakesResolution(is_high_stakes, source)` replaces the bare
+`bool | None` it used to return, symmetric with `resolve_task_type()`'s
+existing `Tier2Resolution(task_type, source)`. This was needed by the drift
+auditing work below, not a standalone cleanup: without it, a live decision
+log couldn't tell whether a high-stakes resolution came from the NN vote or
+the LLM fallback, only that one of them fired.
+
+## Drift auditing: logging every routing decision
+
+Built 2026-07-28, closing the "no shadow evaluation, no live dual-routing,
+no drift auditing" gap this file used to list under "Known rough edges."
+Worth being precise about what this is *not*: `llm-eval-harness`'s
+`calibrate-tier` skill is offline calibration against a fixed, 98-case
+golden set - it answers "does model X clear tier Y's quality floor," never
+touches live traffic, and was never a substitute for this. Before this work,
+`route()` made a real decision on every call but discarded it the instant
+`route_and_run()` returned - there was no logged traffic to check
+`tier2_classifier.AGREEMENT_THRESHOLD` (tuned only against the 98-row seed
+set) against, and no way to catch a wrong `llm_fallback` write-back short of
+noticing bad routing behavior after the fact.
+
+**`decision_log.py`** (new SQL module, see "Architecture" above) writes one
+row to a new `routing_decisions` table (`db/schema.sql`) per `route()` call:
+the resolved `task_type`/`domain` and *which mechanism* produced each -
+`provided` / `inferred` / `tier2_nn` / `tier2_llm_fallback` / `fallback` for
+task_type, `keyword` / `tier2_nn` / `tier2_llm_fallback` / `unavailable` for
+high-stakes - plus the final bias/tier/model/reason. `embedding` is null
+whenever the heuristic grid resolved everything without ever calling
+`embeddings.embed()` - logging a pure-heuristic decision doesn't force one
+into existence. `route()` calls `log_decision()` wrapped in
+`try/except Exception: pass`, same "never let this break routing" discipline
+`tier2_classifier`'s own Postgres/LLM calls already follow - a logging
+failure degrades to "no audit trail for this call," never to a broken route.
+`tests/conftest.py` autouse-patches `log_decision` to a no-op for the whole
+suite so the ~140 pre-existing tests needed zero changes; a handful of new
+`test_router.py` tests override that fixture explicitly to assert the logged
+fields on representative paths.
+
+**`scripts/audit_tier2.py`** re-runs the exact leave-one-out methodology
+whose one-time result is hardcoded in `tier2_classifier.py`'s
+`AGREEMENT_THRESHOLD` comment (72.4%/78.2%/87.1%/100% accuracy at
+unconditional/≥3/5/≥4/5/5/5 agreement on the 98-row seed) against the *live*
+`routing_examples` table via the new `vector_store.all_labeled_examples()`,
+instead of the frozen seed set - printing the same kind of curve plus an
+explicit "current threshold holds / consider raising" verdict. It also flags
+`source='llm_fallback'` rows whose neighbors now confidently disagree with
+their own stored label - a signal an earlier LLM-fallback write-back was
+probably wrong, printed for manual review only, never auto-corrected
+(auto-correcting a label from a heuristic risks compounding the exact error
+class this is trying to catch). An opt-in `--judge-flagged` pass gets one
+cheap second LLM opinion per flagged row, reusing the same
+haiku/`disable_tools=True`/stripped-system-prompt call shape
+`tier2_classifier.py`'s own fallback already uses - not
+`llm-eval-harness`'s `judge_score` (that judges *response quality* against a
+task, a different question from "is this classification label correct").
+Verified against the real local store the day this was built: 101 seeded +
+grown `task_type` rows produced a live curve
+(73.3%/79.0%/88.2%/100.0%) closely tracking the original seed-only numbers,
+threshold verdict "holds," 0 suspect rows; `is_high_stakes` (3 rows at the
+time) correctly reported "not enough rows yet" rather than crashing on too
+small a sample. Manual/periodic, like `seed_vector_store.py` - no cron or
+automation wired up yet.
+
+**Real bug this surfaced, worth restating so it isn't repeated:**
+`vector_store.all_labeled_examples()`'s first draft called `list(row[2])` on
+the embedding column returned by a `register_vector()`-registered
+connection, assuming it'd behave like an iterable/numpy array the way other
+psycopg reads do. It doesn't - psycopg/pgvector returns a `pgvector.Vector`
+object there, which isn't iterable; `list(...)` failed with a real
+`TypeError` the first time this ran against the actual local Postgres store,
+not a hypothetical. Fixed with `Vector.to_list()`. Every other module that
+reads embeddings back out of Postgres should expect the same - `Vector`, not
+a bare list or array - and verify against a real query before assuming
+otherwise.
 
 ## Adding a provider
 
@@ -592,6 +675,11 @@ the point is failing fast and consistently, not just failing.
   full-functionality/`bypassPermissions` behavior. Confirmed deliberately
   with the user (2026-07-26), not an accidental side effect: one adapter, one
   behavior, rather than threading a cost-mode flag through both call paths.
-- No shadow evaluation, no live dual-routing, no drift auditing - this
-  scaffold only exploits the current heuristic grid, it doesn't explore or
-  self-correct yet.
+- ~~No shadow evaluation, no live dual-routing, no drift auditing~~ -
+  **closed 2026-07-28** for the auditing half specifically, see "Drift
+  auditing: logging every routing decision" above: every `route()` decision
+  is now logged, and `scripts/audit_tier2.py` re-validates
+  `AGREEMENT_THRESHOLD` and flags suspect `llm_fallback` rows against live
+  data. Still true: no live dual-routing (a request is never sent to two
+  tiers to compare), and the audit script is manual/periodic, not a running
+  process that self-corrects on its own.
