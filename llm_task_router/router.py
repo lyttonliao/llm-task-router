@@ -111,13 +111,23 @@ def route(request: TaskRequest) -> RouteDecision:
     deliberate human/caller judgment, not second-guessed) a genuine
     high-stakes signal in the description itself
     (classifier.has_high_stakes_signal() - production/security/compliance/
-    irreversibility/scale vocabulary). An inferred H without that
-    corroboration is capped at mid. This is a real, accepted precision/
-    recall tradeoff, not a free lunch: a genuinely hard task that doesn't
-    happen to use recognized high-stakes vocabulary will now be underrouted
-    to mid rather than reaching flagship - see IMPACT_KEYWORDS' docstring for
-    why that's an intentional bet on tier-1 heuristics' limits, not an
-    oversight, pending tier 2/3 of the confidence cascade.
+    irreversibility/scale vocabulary). An inferred H without that keyword
+    corroboration used to be capped straight to mid; as of the tier-2
+    extension below, it instead falls through to tier 2's own
+    resolve_high_stakes() - a genuinely hard task that doesn't use recognized
+    high-stakes vocabulary is no longer permanently underrouted to mid on
+    that basis alone, closing the gap this paragraph originally accepted as
+    a bet on tier-1 heuristics' limits.
+
+    Tier 2 extension of the corroboration gate, added 2026-07-27: when the
+    keyword gate above doesn't corroborate an inferred H, this now calls
+    tier2_classifier.resolve_high_stakes() (same NN-lookup-then-cheap-LLM
+    primitive as task_type resolution, reusing this request's embedding
+    rather than computing a second one) instead of capping to mid
+    unconditionally. True -> escalate to flagship for real; False or
+    None (tier 2 unavailable) both still cap to mid, same as the old
+    unconditional behavior - tier 2 only ever adds a path to a *correct*
+    escalation, it never removes the existing safety cap.
 
     Tier 3 for the no-signal band, added 2026-07-27: a keyword-list approach
     to distinguishing "repeat this word: hello" (trivial, should be cheap)
@@ -179,14 +189,29 @@ def route(request: TaskRequest) -> RouteDecision:
         grid_bias = classify(resolved_task_type, classification.domain)
         needs_corroboration = grid_bias == "H" and resolved_task_type_source != "provided"
         if needs_corroboration and not has_high_stakes_signal(request.description):
-            bias = "M"
-            reason = (
-                f"heuristic grid said H for {resolved_task_type} x {classification.domain} "
-                f"(type {resolved_task_type_source}), but no high-stakes signal (production/"
-                "security/compliance/irreversibility/scale) was found in the description - capped at "
-                "mid; flagship requires confirmed difficulty/consequence/ambiguity, not just an "
-                "inferred shape/domain match"
+            if embedding is None:
+                embedding = embeddings.embed(request.description)
+            tier2_high_stakes = tier2_classifier.resolve_high_stakes(
+                request.description, embedding, task_type=resolved_task_type
             )
+            if tier2_high_stakes:
+                bias = grid_bias
+                reason = (
+                    f"heuristic grid said H for {resolved_task_type} x {classification.domain} "
+                    f"(type {resolved_task_type_source}); no keyword corroborated it, but tier 2's "
+                    "continuous-learning classifier confirmed genuine high stakes - escalated to flagship"
+                )
+            else:
+                bias = "M"
+                reason = (
+                    f"heuristic grid said H for {resolved_task_type} x {classification.domain} "
+                    f"(type {resolved_task_type_source}), but no high-stakes signal (production/"
+                    "security/compliance/irreversibility/scale) was found in the description, and tier "
+                    "2's continuous-learning classifier "
+                    + ("confirmed no genuine high stakes" if tier2_high_stakes is False else "was unavailable")
+                    + " - capped at mid; flagship requires confirmed difficulty/consequence/ambiguity, "
+                    "not just an inferred shape/domain match"
+                )
         else:
             bias = grid_bias
             reason = (

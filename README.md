@@ -252,10 +252,14 @@ the calibrated Claude tier.
 
 ## Status
 
-Scaffold only implements a slice of the full design: the tier-1 heuristic
-classifier, Claude + Codex provider adapters, and a Claude-only tier map.
-Tiers 2 and 3 of the classifier cascade, shadow evaluation, and any
-non-Claude tier entries are pillars on paper, not code yet.
+Implements a two-tier classifier cascade as of 2026-07-27 (the original
+three-tier design was revised during review - see `CLAUDE.md`, "The
+classifier is a two-tier cascade"): tier 1's heuristic grid, and tier 2, a
+continuous-learning classifier (local embeddings + a pgvector-backed store
+of labeled examples, with a cheap-LLM fallback that writes its own answer
+back). Claude + Codex provider adapters and a Claude-only tier map are also
+in place. Shadow evaluation and any non-Claude tier entries remain pillars
+on paper, not code yet.
 
 The tier-1 classifier's own accuracy is unmeasured: `classify_description()`
 is a keyword-bag heuristic, not something benchmarked against a labeled set

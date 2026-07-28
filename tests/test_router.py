@@ -33,18 +33,78 @@ def test_route_infers_metadata_when_caller_omits_it():
 
 
 def test_route_caps_inferred_architecture_keywords_at_mid_without_high_stakes_signal():
-    """Superseded 2026-07-27: an *inferred* architecture-shape match ("design",
-    "scalable", "fault-tolerant") used to escalate to flagship on shape alone.
-    That's too broad - the same "design" keyword fires just as readily on a
-    trivial question. Without a genuine high-stakes signal (production/
-    security/compliance/irreversibility/scale vocabulary) in the description,
-    this is now capped at mid, not flagship."""
+    """Superseded 2026-07-27 (twice): an *inferred* architecture-shape match
+    ("design", "scalable", "fault-tolerant") used to escalate to flagship on
+    shape alone - too broad, since the same "design" keyword fires just as
+    readily on a trivial question. First fix: cap at mid without a genuine
+    high-stakes keyword signal. Second fix (same day): the keyword-negative
+    case now also falls through to tier 2's resolve_high_stakes() instead of
+    capping unconditionally - this test pins tier 2 as unavailable (mocked
+    None) to isolate the *keyword-negative-and-tier-2-unavailable* case,
+    which must still cap at mid exactly like the old unconditional behavior.
+    See test_route_escalates_high_stakes_via_tier2_without_a_keyword_match
+    below for the case where tier 2 actually corroborates it."""
     request = TaskRequest(description="design a scalable, fault-tolerant system for this workload")
-    decision = route(request)
+    with (
+        patch("llm_task_router.router.embeddings.embed", return_value=[0.1, 0.2]),
+        patch("llm_task_router.router.tier2_classifier.resolve_high_stakes", return_value=None) as mock_resolve,
+    ):
+        decision = route(request)
 
+    mock_resolve.assert_called_once_with(
+        "design a scalable, fault-tolerant system for this workload", [0.1, 0.2], task_type="architecture"
+    )
     assert decision.tier == "mid"
     assert decision.model == "sonnet"
     assert "no high-stakes signal" in decision.reason
+    assert "tier 2's continuous-learning classifier was unavailable" in decision.reason
+
+
+def test_route_escalates_high_stakes_via_tier2_without_a_keyword_match():
+    """The actually-ambiguous case tier 2's corroboration extension targets:
+    no IMPACT_KEYWORDS match, but tier 2's continuous-learning classifier
+    (NN lookup or its own cheap-LLM fallback) confirms genuine high stakes
+    anyway - a real task that just doesn't happen to use recognized
+    high-stakes vocabulary should still be able to reach flagship."""
+    request = TaskRequest(description="design a scalable, fault-tolerant system for this workload")
+    with (
+        patch("llm_task_router.router.embeddings.embed", return_value=[0.1, 0.2]),
+        patch("llm_task_router.router.tier2_classifier.resolve_high_stakes", return_value=True) as mock_resolve,
+    ):
+        decision = route(request)
+
+    mock_resolve.assert_called_once_with(
+        "design a scalable, fault-tolerant system for this workload", [0.1, 0.2], task_type="architecture"
+    )
+    assert decision.tier == "flagship"
+    assert decision.model == "opus"
+    assert "tier 2's continuous-learning classifier confirmed genuine high stakes" in decision.reason
+
+
+def test_route_caps_at_mid_when_tier2_corroboration_confirms_no_high_stakes():
+    request = TaskRequest(description="design a scalable, fault-tolerant system for this workload")
+    with (
+        patch("llm_task_router.router.embeddings.embed", return_value=[0.1, 0.2]),
+        patch("llm_task_router.router.tier2_classifier.resolve_high_stakes", return_value=False),
+    ):
+        decision = route(request)
+
+    assert decision.tier == "mid"
+    assert "confirmed no genuine high stakes" in decision.reason
+
+
+def test_route_needs_corroboration_keyword_positive_skips_tier2_entirely():
+    """Free keyword evidence should never be re-spent on a tier-2 call - only
+    the keyword-negative case falls through."""
+    request = TaskRequest(
+        description="design the multi-region disaster recovery strategy for our payment processing system, "
+        "given a strict compliance requirement"
+    )
+    with patch("llm_task_router.router.tier2_classifier.resolve_high_stakes") as mock_resolve:
+        decision = route(request)
+
+    mock_resolve.assert_not_called()
+    assert decision.tier == "flagship"
 
 
 def test_route_escalates_inferred_architecture_to_flagship_with_high_stakes_signal():

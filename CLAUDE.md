@@ -11,8 +11,18 @@ prompt/model quality offline to calibrate the tiers this router picks from.
   headless CLI (`claude -p`, `codex exec`) instead of an API/SDK, same
   cost-avoidance rationale as `llm-eval-harness`'s `claude_cli.py`: no
   separate per-token billing, runs on existing subscriptions.
-- **Zero third-party dependencies** — stdlib only (`dataclasses`, `argparse`,
-  `subprocess`, `json`), matching `llm-eval-harness`.
+- **Zero third-party dependencies for the CLI/provider-adapter layer** —
+  stdlib only (`dataclasses`, `argparse`, `subprocess`, `json`), matching
+  `llm-eval-harness`. **No longer true repo-wide**, as of the tier-2
+  continuous-learning classifier (2026-07-27, see "The classifier is a
+  two-tier cascade" below): `sentence-transformers` (local embeddings) and
+  `psycopg`/`pgvector` (Postgres client) are real, permanent runtime
+  dependencies of `tier2_classifier.py`. This was a deliberate, discussed
+  choice, not scope creep — building the actual long-term product (a
+  continuous-learning classifier) was judged more valuable than staying
+  dependency-free for its own sake. The rule still holds everywhere else in
+  this repo; don't read this exception as license to add dependencies
+  elsewhere without the same deliberate discussion.
 - **Independent from `llm-eval-harness`.** This repo has its own dataclasses
   and its own provider adapters rather than importing the eval harness as a
   package. The two projects interact conceptually (the harness's benchmark
@@ -33,6 +43,13 @@ llm_task_router/
                     end against a real install and a real authenticated call
                     (see rough edges below for what's still unverified)
   classifier.py   - tier-1 heuristic rule table (type x domain grid)
+  embeddings.py   - tier-2: local sentence-transformers embedding wrapper
+  vector_store.py - tier-2: the only module with SQL - pgvector-backed
+                    routing_examples store (nearest_neighbors/insert_example)
+  tier2_classifier.py - tier-2 orchestration: NN lookup + cheap-LLM
+                    fallback-with-write-back (see "Tier 2: the
+                    continuous-learning classifier" below)
+  db/schema.sql   - routing_examples DDL, applied manually via psql
   tiers.py        - tier name -> concrete (provider, model) mapping
   known_models.py - static known-model table, display-only, NOT used for
                     routing (see "llm-chat" below)
@@ -51,14 +68,20 @@ llm_task_router/
                     styling" below)
 ```
 
-## The classifier is a three-tier cascade; only tier 1 exists
+## The classifier is a two-tier cascade: heuristic + continuous-learning classifier
 
-The full design (from the router planning thread) is a confidence cascade:
-1. **Heuristic rule table** (`classifier.py`) - cheapest, fires first. This is
-   the only tier implemented so far.
-2. A **trained model**, cold-started from `llm-eval-harness` golden-set
-   labels, for cases the heuristic doesn't confidently cover. Not built.
-3. A **cheap LLM call** for the remaining ambiguity band. Not built.
+The design was originally scoped as a three-tier cascade (heuristic rule
+table → a trained model cold-started from `llm-eval-harness` golden-set
+labels → a cheap-LLM call for the remaining ambiguity band). That changed
+during design review on 2026-07-27: rather than build the originally-scoped
+intermediate step (a static offline-trained classifier, then a separate
+cheap-LLM-fallback tier), the decision was to build the actual long-term
+product directly. **Tier 2 now absorbs what would have been both the
+"trained model" and "cheap-LLM fallback" tiers into one mechanism** — see
+"Tier 2: the continuous-learning classifier" below for what was actually
+built. `classifier.py`'s heuristic rule table remains tier 1, unchanged,
+still the free/zero-latency first pass; it's expected to be deprecated later
+(not yet) once tier 2 has earned enough coverage to be trusted alone.
 
 ~~Default-to-escalate under uncertainty, not default-to-cheap~~ - **superseded
 2026-07-27, see below.** This was the original principle (an underrouted,
@@ -95,13 +118,14 @@ two fixes made the same day, in this order, before it was corrected outright:
 
 **The net effect: escalation to flagship is now precision-first, not
 recall-first** - the opposite bias from the original principle above. This
-is a real, accepted tradeoff: a genuinely hard task that doesn't happen to
-use recognized high-stakes vocabulary (e.g. "migrate the k8s cluster to a
-new region" - no "multi-region"/"disaster recovery" wording) will now be
-underrouted to `mid` rather than reaching flagship. That's the documented
-cost of not having the rest of the cascade built yet - closing it for real
-needs the trained model tier (tier 2, still not built) or a longer guessed
-keyword list, which is exactly what the discipline below rejects.
+was a real, accepted tradeoff at the time: a genuinely hard task that
+doesn't happen to use recognized high-stakes vocabulary (e.g. "migrate the
+k8s cluster to a new region" - no "multi-region"/"disaster recovery"
+wording) would be underrouted to `mid` rather than reaching flagship.
+**Closed 2026-07-27** by tier 2's `resolve_high_stakes()` (see "Tier 2: the
+continuous-learning classifier" below) - that exact k8s-migration example
+now correctly escalates to flagship, confirmed against a real run, not just
+a design intention.
 
 **Fix 3 - tier 3 (cheap-LLM fallback) built for the no-signal band,
 2026-07-27.** The no-signal hedge (Fix 1) still routed every unclassifiable
@@ -152,10 +176,84 @@ path, accepted because it's what actually lets a trivial request reach the
 cheap tier instead of either overpaying at mid (the old hedge) or
 misclassifying via a keyword list that won't generalize.
 
-Adding tier 2 (or extending tier 3 to the `needs_corroboration` branch)
-means giving `classifier.classify()` a confidence signal and having
-`router.route()` fall through when it's low - don't restructure `route()`'s
-shape to do this, extend it, the same way tier 3 was added here.
+## Tier 2: the continuous-learning classifier
+
+Built 2026-07-27, same day as the design pivot away from the three-tier
+scope above. Not a static trained model - a live, growing mechanism:
+embeddings + a pgvector-backed store of labeled examples, falling through to
+one cheap LLM call (writing its own answer back as a new labeled row) for
+whatever the store can't yet answer confidently. Both `route()` call sites
+below use the exact same primitive against two different questions - "what
+task_type is this?" and "is this genuinely high-stakes?" - rather than two
+separate mechanisms.
+
+**New modules** (`llm_task_router/`): `embeddings.py` (`embed(text) ->
+list[float]`, lazy-singleton `sentence-transformers` `all-MiniLM-L6-v2`,
+384-dim), `vector_store.py` (the only module with SQL - `nearest_neighbors()`
+and `insert_example()` against a `routing_examples` table, connection via
+`DATABASE_URL`), `tier2_classifier.py` (`resolve_task_type()` /
+`resolve_high_stakes()` - the orchestration `router.py` actually calls).
+Schema at `llm_task_router/db/schema.sql`, applied manually once
+(`psql -f llm_task_router/db/schema.sql`) against a local Postgres with the
+`pgvector` extension - not run automatically, no migration framework at this
+stage. `scripts/seed_vector_store.py` cold-starts the store from
+`llm-eval-harness`'s 98 golden cases (the one place this repo reads the
+sibling repo's files, and only offline/one-time - never at runtime), mapping
+each case's suite file to a `task_type` label; no `is_high_stakes` ground
+truth exists in that data, so that column starts entirely empty and only
+fills in as real `needs_corroboration`-shaped requests get resolved through
+tier 2 over time.
+
+**Only LLM-fallback resolutions get written back, not NN-confident ones** -
+a matching neighbor already covers that region of the embedding space, so
+writing it again would add near-duplicate rows without new information.
+This is what makes it "continuous learning" rather than a one-time cold
+start: the exact same question never needs a second LLM call.
+
+**`AGREEMENT_THRESHOLD` (0.8, i.e. ≥4/5 of the k=5 nearest neighbors must
+share a label) came from a real leave-one-out check against the seeded
+store, not a guess - and it overturned the original design en route.** Two
+findings, both worth keeping since the first one directly contradicts what
+was assumed going in:
+1. Raw cosine similarity does **not** cleanly separate same-task_type from
+   different-task_type neighbors at this data/model scale (same-label pairs
+   measured median ~0.32, cross-label median ~0.29 - heavily overlapping). A
+   hard similarity floor (the first draft of this module) would have
+   rejected most true matches. This is the same shape of finding
+   `llm-eval-harness`'s CLAUDE.md already documents for a structurally
+   similar problem ("regex, not AST or embeddings") - off-the-shelf
+   embeddings not cleanly separating a soft-semantic distinction at small
+   data scale, confirmed independently a second time on a different problem.
+2. Relative agreement among the k nearest neighbors **does** carry real
+   signal despite (1): leave-one-out majority-of-5 vote scored 72.4%
+   accuracy unconditionally (98 samples, 7 classes, chance ~14%), rising
+   monotonically with agreement - 78.2% at ≥3/5 (80% coverage), 87.1% at
+   ≥4/5 (32% coverage), 100% at 5/5 (8% coverage, too rare to rely on
+   alone). `AGREEMENT_THRESHOLD=0.8` was chosen from that curve, erring
+   toward the more-accurate LLM fallback over a borderline NN vote -
+   consistent with this repo's original escalate-under-uncertainty instinct
+   (superseded above for the *keyword* gate specifically, but still the
+   right default for tier 2's own confidence gate). A neighbor set smaller
+   than `NEIGHBOR_K=5` (the store barely has labeled examples yet for that
+   axis - true of `is_high_stakes` at seed time) never counts as confident
+   regardless of agreement fraction, for the same reason.
+
+**`needs_corroboration` (Fix 2 above) is no longer permanently capped to mid
+on a keyword-negative miss.** `router.route()`'s corroboration branch now
+falls through to `tier2_classifier.resolve_high_stakes()` (reusing the same
+embedding already computed for task_type resolution when there is one,
+rather than paying for a second one) instead of capping unconditionally.
+Keyword-positive matches still skip this entirely - free evidence, no need
+to spend a call re-confirming it. `True` escalates to flagship for real;
+`False` or `None` (tier 2 unavailable) both still cap to mid, exactly like
+the old unconditional behavior - tier 2 only ever adds a path to a *correct*
+escalation, never removes the existing safety cap.
+
+**Both `resolve_task_type()` and `resolve_high_stakes()` return `None`/fall
+back on any failure** - provider error, unparseable text, or a raised
+exception - same discipline `_classify_via_llm()` already established for
+tier 3's no-signal band. `router.py` treats tier-2-unavailable as "fall back
+to the existing heuristic-only behavior," never as a crash.
 
 ## Adding a provider
 
