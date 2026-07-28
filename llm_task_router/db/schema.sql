@@ -23,3 +23,27 @@ CREATE TABLE routing_examples (
 
 CREATE INDEX routing_examples_embedding_hnsw
     ON routing_examples USING hnsw (embedding vector_cosine_ops);
+
+-- Drift-auditing decision log: one row per live route() call, written by
+-- decision_log.py (see that module and scripts/audit_tier2.py). Queried by
+-- scan/time-range for audits, not nearest-neighbor lookup - no HNSW index.
+CREATE TABLE routing_decisions (
+    id BIGSERIAL PRIMARY KEY,
+    description TEXT NOT NULL,
+    embedding VECTOR(384),                -- null when the heuristic resolved everything for free
+    resolved_task_type TEXT NOT NULL,
+    task_type_source TEXT NOT NULL,       -- provided | inferred | tier2_nn | tier2_llm_fallback | fallback
+    domain TEXT,
+    domain_source TEXT NOT NULL,          -- provided | inferred | fallback
+    resolved_is_high_stakes BOOLEAN,      -- null when the corroboration branch was never entered
+    high_stakes_source TEXT,              -- keyword | tier2_nn | tier2_llm_fallback | unavailable | null
+    no_signal_llm_used BOOLEAN NOT NULL DEFAULT false,
+    bias TEXT NOT NULL,
+    tier TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX routing_decisions_created_at ON routing_decisions (created_at);
