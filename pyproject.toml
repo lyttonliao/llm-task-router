@@ -3,7 +3,11 @@ name = "llm-task-router"
 version = "0.1.0"
 description = "Cost/quality-aware router: classifies a task and dispatches it to the cheapest model tier that clears a quality floor."
 requires-python = ">=3.14"
-dependencies = []
+dependencies = [
+    "pgvector>=0.5.0",
+    "psycopg[binary]>=3.3.4",
+    "sentence-transformers>=5.6.1",
+]
 
 [project.scripts]
 llm-route = "llm_task_router.cli:main"
