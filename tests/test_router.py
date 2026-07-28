@@ -1,5 +1,6 @@
 from unittest.mock import patch
 
+from llm_task_router import tier2_classifier
 from llm_task_router.schema import ProviderResult, TaskRequest
 from llm_task_router.router import route, route_and_run
 
@@ -84,9 +85,15 @@ def test_route_hedges_to_mid_when_no_keyword_signal_and_tier3_is_unavailable():
     either, must still hedge at mid, not flagship - flagship is earned by an
     actual signal, not awarded to "we don't know"."""
     request = TaskRequest(description="reply with exactly the word: pong")
-    with patch(
-        "llm_task_router.router.claude_cli.invoke",
-        return_value=ProviderResult(text="", cost_usd=0.0, duration_ms=0, error="mocked - not exercising tier-3 here"),
+    with (
+        patch("llm_task_router.router.embeddings.embed", return_value=[0.0]),
+        patch("llm_task_router.router.tier2_classifier.resolve_task_type", return_value=None),
+        patch(
+            "llm_task_router.router.claude_cli.invoke",
+            return_value=ProviderResult(
+                text="", cost_usd=0.0, duration_ms=0, error="mocked - not exercising tier-3 here"
+            ),
+        ),
     ):
         decision = route(request)
 
@@ -97,10 +104,14 @@ def test_route_hedges_to_mid_when_no_keyword_signal_and_tier3_is_unavailable():
 
 def test_route_no_signal_llm_fallback_returns_cheap():
     request = TaskRequest(description="repeat this word: hello")
-    with patch(
-        "llm_task_router.router.claude_cli.invoke",
-        return_value=ProviderResult(text="CHEAP", cost_usd=0.003, duration_ms=400),
-    ) as mock_invoke:
+    with (
+        patch("llm_task_router.router.embeddings.embed", return_value=[0.0]),
+        patch("llm_task_router.router.tier2_classifier.resolve_task_type", return_value=None),
+        patch(
+            "llm_task_router.router.claude_cli.invoke",
+            return_value=ProviderResult(text="CHEAP", cost_usd=0.003, duration_ms=400),
+        ) as mock_invoke,
+    ):
         decision = route(request)
 
     assert decision.tier == "cheap"
@@ -115,9 +126,13 @@ def test_route_no_signal_llm_fallback_returns_cheap():
 
 def test_route_no_signal_llm_fallback_returns_mid():
     request = TaskRequest(description="repeat this word: hello")
-    with patch(
-        "llm_task_router.router.claude_cli.invoke",
-        return_value=ProviderResult(text="MID", cost_usd=0.003, duration_ms=400),
+    with (
+        patch("llm_task_router.router.embeddings.embed", return_value=[0.0]),
+        patch("llm_task_router.router.tier2_classifier.resolve_task_type", return_value=None),
+        patch(
+            "llm_task_router.router.claude_cli.invoke",
+            return_value=ProviderResult(text="MID", cost_usd=0.003, duration_ms=400),
+        ),
     ):
         decision = route(request)
 
@@ -128,9 +143,13 @@ def test_route_no_signal_llm_fallback_returns_mid():
 
 def test_route_no_signal_llm_fallback_returns_flagship():
     request = TaskRequest(description="repeat this word: hello")
-    with patch(
-        "llm_task_router.router.claude_cli.invoke",
-        return_value=ProviderResult(text="FLAGSHIP", cost_usd=0.003, duration_ms=400),
+    with (
+        patch("llm_task_router.router.embeddings.embed", return_value=[0.0]),
+        patch("llm_task_router.router.tier2_classifier.resolve_task_type", return_value=None),
+        patch(
+            "llm_task_router.router.claude_cli.invoke",
+            return_value=ProviderResult(text="FLAGSHIP", cost_usd=0.003, duration_ms=400),
+        ),
     ):
         decision = route(request)
 
@@ -141,9 +160,13 @@ def test_route_no_signal_llm_fallback_returns_flagship():
 
 def test_route_no_signal_llm_fallback_unparseable_text_falls_back_to_mid():
     request = TaskRequest(description="repeat this word: hello")
-    with patch(
-        "llm_task_router.router.claude_cli.invoke",
-        return_value=ProviderResult(text="uh, I'm not sure?", cost_usd=0.003, duration_ms=400),
+    with (
+        patch("llm_task_router.router.embeddings.embed", return_value=[0.0]),
+        patch("llm_task_router.router.tier2_classifier.resolve_task_type", return_value=None),
+        patch(
+            "llm_task_router.router.claude_cli.invoke",
+            return_value=ProviderResult(text="uh, I'm not sure?", cost_usd=0.003, duration_ms=400),
+        ),
     ):
         decision = route(request)
 
@@ -154,9 +177,15 @@ def test_route_no_signal_llm_fallback_unparseable_text_falls_back_to_mid():
 
 def test_route_no_signal_llm_fallback_provider_error_falls_back_to_mid():
     request = TaskRequest(description="repeat this word: hello")
-    with patch(
-        "llm_task_router.router.claude_cli.invoke",
-        return_value=ProviderResult(text="", cost_usd=0.0, duration_ms=0, error="auth check failed: not logged in"),
+    with (
+        patch("llm_task_router.router.embeddings.embed", return_value=[0.0]),
+        patch("llm_task_router.router.tier2_classifier.resolve_task_type", return_value=None),
+        patch(
+            "llm_task_router.router.claude_cli.invoke",
+            return_value=ProviderResult(
+                text="", cost_usd=0.0, duration_ms=0, error="auth check failed: not logged in"
+            ),
+        ),
     ):
         decision = route(request)
 
@@ -169,14 +198,61 @@ def test_route_no_signal_llm_fallback_exception_falls_back_to_mid():
     raise (check_auth()'s subprocess.run has no FileNotFoundError guard), so
     _classify_via_llm()'s try/except must actually catch it."""
     request = TaskRequest(description="repeat this word: hello")
-    with patch(
-        "llm_task_router.router.claude_cli.invoke",
-        side_effect=RuntimeError("boom"),
+    with (
+        patch("llm_task_router.router.embeddings.embed", return_value=[0.0]),
+        patch("llm_task_router.router.tier2_classifier.resolve_task_type", return_value=None),
+        patch(
+            "llm_task_router.router.claude_cli.invoke",
+            side_effect=RuntimeError("boom"),
+        ),
     ):
         decision = route(request)
 
     assert decision.tier == "mid"
     assert decision.model == "sonnet"
+
+
+def test_route_resolves_task_type_via_tier2_when_heuristic_finds_no_signal():
+    """A description with zero TYPE_KEYWORDS overlap used to fall all the way
+    to the no-signal branch's difficulty-judgment call. Tier 2 now gets a
+    chance to resolve task_type first - a confident tier-2 answer reaches the
+    grid directly, without ever making the tier-3 CHEAP/MID/FLAGSHIP call."""
+    request = TaskRequest(description="put together a plan for the quarterly numbers")
+    with (
+        patch("llm_task_router.router.embeddings.embed", return_value=[0.1, 0.2]) as mock_embed,
+        patch(
+            "llm_task_router.router.tier2_classifier.resolve_task_type",
+            return_value=tier2_classifier.Tier2Resolution(task_type="code_gen", source="llm_fallback"),
+        ) as mock_resolve,
+        patch("llm_task_router.router.claude_cli.invoke") as mock_invoke,
+    ):
+        decision = route(request)
+
+    mock_embed.assert_called_once_with("put together a plan for the quarterly numbers")
+    mock_resolve.assert_called_once_with("put together a plan for the quarterly numbers", [0.1, 0.2])
+    mock_invoke.assert_not_called()  # resolved via tier 2 + grid, no tier-3 LLM call needed
+    assert decision.tier == "cheap"  # code_gen x other = L
+    assert "code_gen x other" in decision.reason
+    assert "type tier2" in decision.reason
+
+
+def test_route_falls_through_to_tier3_when_tier2_also_has_nothing():
+    """Tier 2 declining (returns None) must still fall through to the
+    existing no-signal tier-3 behavior, not crash or silently misroute."""
+    request = TaskRequest(description="put together a plan for the quarterly numbers")
+    with (
+        patch("llm_task_router.router.embeddings.embed", return_value=[0.1, 0.2]),
+        patch("llm_task_router.router.tier2_classifier.resolve_task_type", return_value=None) as mock_resolve,
+        patch(
+            "llm_task_router.router.claude_cli.invoke",
+            return_value=ProviderResult(text="MID", cost_usd=0.003, duration_ms=400),
+        ) as mock_invoke,
+    ):
+        decision = route(request)
+
+    mock_resolve.assert_called_once()
+    mock_invoke.assert_called_once()
+    assert decision.tier == "mid"
 
 
 def test_route_uses_grid_normally_when_only_domain_axis_is_unresolved():

@@ -1,16 +1,22 @@
 """Orchestrates classify -> resolve tier -> invoke provider.
 
 The tier-1 heuristic grid (classifier.py) drives routing for every case with
-real keyword signal. Tier 3 - a cheap-LLM-call fallback - was added
-2026-07-27, scoped only to the no-signal band (see route()'s docstring); a
-trained model, cold-started from llm-eval-harness golden-set labels, for
-cases the heuristic doesn't cover confidently, is still not built (tier 2).
-Adding that tier means giving classify() a confidence signal and falling
-through to it here, not replacing this function's shape.
+real keyword signal. Tier 2 - a continuous-learning classifier (embeddings +
+a pgvector-backed store of labeled examples, falling through to a cheap-LLM
+call that writes its own answer back) - was added 2026-07-27; see
+tier2_classifier.py's module docstring for the full design. This module's
+job is only to call it at the right point and use its answer, not to know
+how it works internally (see route()'s docstring for exactly where it's
+called). Originally this project was scoped as a three-tier cascade
+(heuristic -> trained model -> cheap-LLM fallback); that direction changed
+during design review to two tiers, with tier 2 absorbing what would have
+been both the "trained model" and "cheap-LLM fallback" tiers into one
+lookup-then-ask-and-remember mechanism.
 """
 
 from collections.abc import Callable
 
+from llm_task_router import embeddings, tier2_classifier
 from llm_task_router.classifier import classify, classify_description, has_high_stakes_signal
 from llm_task_router.providers import claude_cli, codex_cli
 from llm_task_router.schema import ProviderResult, RouteDecision, TaskRequest
@@ -116,24 +122,44 @@ def route(request: TaskRequest) -> RouteDecision:
     Tier 3 for the no-signal band, added 2026-07-27: a keyword-list approach
     to distinguishing "repeat this word: hello" (trivial, should be cheap)
     from "help with this request" (genuinely ambiguous, the mid hedge above
-    is correct) was tried and rejected - it doesn't generalize, and a
-    vector-DB/embeddings alternative was evaluated and rejected too (breaks
-    this repo's zero-third-party-dependency rule, and llm-eval-harness's own
-    CLAUDE.md already found embeddings don't cleanly separate this kind of
-    soft semantic distinction - see that repo's "regex, not AST or
-    embeddings" section). Instead, the no-signal branch now makes one cheap,
-    stripped haiku call (_classify_via_llm()) asking the model to judge the
-    task's actual difficulty/consequence/ambiguity directly - genuinely a
-    judgment call, which is what a small model is good at and keyword
-    matching structurally isn't. Falls back to the mid hedge on any failure
-    (see _classify_via_llm()'s docstring). Scoped to the no-signal branch
-    only - the needs_corroboration branch below has a different failure
-    mode (underrouting a possibly-genuinely-hard task, not overrouting a
-    trivial one) and was deliberately left alone here.
+    is correct) was tried and rejected - it doesn't generalize. This repo's
+    zero-third-party-dependency rule and llm-eval-harness's finding that
+    embeddings don't cleanly separate soft semantic distinctions both applied
+    at the time - see tier2_classifier.py's module docstring for how tier 2
+    later revisited both of those with real data instead of settling for the
+    no-signal band alone. This branch makes one cheap, stripped haiku call
+    (_classify_via_llm()) asking the model to judge the task's actual
+    difficulty/consequence/ambiguity directly. Falls back to the mid hedge on
+    any failure (see _classify_via_llm()'s docstring).
+
+    Tier 2, added 2026-07-27 (before this no-signal branch runs): when the
+    heuristic grid found zero task_type keyword signal at all
+    (classification.task_type_source == "fallback"), tier 2 gets a chance to
+    resolve it before falling all the way through to the no-signal
+    difficulty-judgment call above - a description that trips a domain
+    keyword ("kubernetes") but zero TYPE_KEYWORDS used to be silently
+    mislabeled task_type="architecture" (classify_description()'s safety
+    placeholder) and pushed straight into architecture's uniform-H grid row;
+    tier 2 can now correct that placeholder first. Only task_type is in
+    scope for tier 2 - domain stays on the keyword heuristic indefinitely
+    (see tier2_classifier.py's docstring for why). A successful resolution
+    marks resolved_task_type_source="tier2", which the no_signal check and
+    needs_corroboration gate below both treat as "we have a real signal now,"
+    same as "inferred" - not as another flavor of "fallback".
     """
     classification = classify_description(request.description, request.task_type, request.domain)
 
-    no_signal = classification.task_type_source == "fallback" and classification.domain_source == "fallback"
+    resolved_task_type = classification.task_type
+    resolved_task_type_source = classification.task_type_source
+    embedding: list[float] | None = None
+    if classification.task_type_source == "fallback":
+        embedding = embeddings.embed(request.description)
+        tier2_resolution = tier2_classifier.resolve_task_type(request.description, embedding)
+        if tier2_resolution is not None:
+            resolved_task_type = tier2_resolution.task_type
+            resolved_task_type_source = "tier2"
+
+    no_signal = resolved_task_type_source == "fallback" and classification.domain_source == "fallback"
     if no_signal:
         llm_bias = _classify_via_llm(request.description)
         if llm_bias is not None:
@@ -150,13 +176,13 @@ def route(request: TaskRequest) -> RouteDecision:
                 "by default (see router.route()'s no-signal fallback note)"
             )
     else:
-        grid_bias = classify(classification.task_type, classification.domain)
-        needs_corroboration = grid_bias == "H" and classification.task_type_source != "provided"
+        grid_bias = classify(resolved_task_type, classification.domain)
+        needs_corroboration = grid_bias == "H" and resolved_task_type_source != "provided"
         if needs_corroboration and not has_high_stakes_signal(request.description):
             bias = "M"
             reason = (
-                f"heuristic grid said H for {classification.task_type} x {classification.domain} "
-                f"(type {classification.task_type_source}), but no high-stakes signal (production/"
+                f"heuristic grid said H for {resolved_task_type} x {classification.domain} "
+                f"(type {resolved_task_type_source}), but no high-stakes signal (production/"
                 "security/compliance/irreversibility/scale) was found in the description - capped at "
                 "mid; flagship requires confirmed difficulty/consequence/ambiguity, not just an "
                 "inferred shape/domain match"
@@ -164,8 +190,8 @@ def route(request: TaskRequest) -> RouteDecision:
         else:
             bias = grid_bias
             reason = (
-                f"heuristic grid: {classification.task_type} x {classification.domain} -> {bias} "
-                f"(type {classification.task_type_source}, domain {classification.domain_source})"
+                f"heuristic grid: {resolved_task_type} x {classification.domain} -> {bias} "
+                f"(type {resolved_task_type_source}, domain {classification.domain_source})"
             )
 
     tier = TIER_BIAS[bias]
