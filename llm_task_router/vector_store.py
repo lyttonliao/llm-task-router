@@ -96,7 +96,7 @@ def all_labeled_examples(label_column: str) -> list[LabeledExample]:
         cur.execute(query)
         rows = cur.fetchall()
     return [
-        LabeledExample(id=row[0], description=row[1], embedding=list(row[2]), label=row[3], source=row[4])
+        LabeledExample(id=row[0], description=row[1], embedding=row[2].to_list(), label=row[3], source=row[4])
         for row in rows
     ]
 

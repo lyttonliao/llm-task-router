@@ -158,8 +158,8 @@ def test_all_labeled_examples_rejects_unknown_label_column_without_connecting():
 def test_all_labeled_examples_returns_every_row_with_embedding():
     fake_cursor = _FakeCursor(
         fetchall_return=[
-            (1, "write a function that validates emails", [0.1, 0.2, 0.3], "code_gen", "seed"),
-            (2, "migrate the payments DB with zero downtime", [0.4, 0.5, 0.6], "multi_step", "llm_fallback"),
+            (1, "write a function that validates emails", Vector([0.1, 0.2, 0.3]), "code_gen", "seed"),
+            (2, "migrate the payments DB with zero downtime", Vector([0.4, 0.5, 0.6]), "multi_step", "llm_fallback"),
         ]
     )
     fake_conn = _FakeConnection(fake_cursor)
@@ -174,12 +174,12 @@ def test_all_labeled_examples_returns_every_row_with_embedding():
     mock_register.assert_called_once_with(fake_conn)
     assert result == [
         LabeledExample(
-            id=1, description="write a function that validates emails", embedding=[0.1, 0.2, 0.3],
+            id=1, description="write a function that validates emails", embedding=Vector([0.1, 0.2, 0.3]).to_list(),
             label="code_gen", source="seed",
         ),
         LabeledExample(
-            id=2, description="migrate the payments DB with zero downtime", embedding=[0.4, 0.5, 0.6],
-            label="multi_step", source="llm_fallback",
+            id=2, description="migrate the payments DB with zero downtime",
+            embedding=Vector([0.4, 0.5, 0.6]).to_list(), label="multi_step", source="llm_fallback",
         ),
     ]
     query, params = fake_cursor.executed[0]
