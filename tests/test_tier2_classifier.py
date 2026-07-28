@@ -6,7 +6,12 @@ matching the mocking style already used in test_router.py for tier-3."""
 from unittest.mock import patch
 
 from llm_task_router.schema import ProviderResult
-from llm_task_router.tier2_classifier import Tier2Resolution, resolve_high_stakes, resolve_task_type
+from llm_task_router.tier2_classifier import (
+    HighStakesResolution,
+    Tier2Resolution,
+    resolve_high_stakes,
+    resolve_task_type,
+)
 from llm_task_router.vector_store import NeighborMatch
 
 _EMBEDDING = [0.1, 0.2, 0.3]
@@ -162,7 +167,7 @@ def test_resolve_high_stakes_uses_nn_majority_when_confident():
     ):
         result = resolve_high_stakes("migrate the k8s cluster to a new region", _EMBEDDING)
 
-    assert result is True
+    assert result == HighStakesResolution(is_high_stakes=True, source="nn")
     mock_nn.assert_called_once_with(_EMBEDDING, "is_high_stakes", k=5)
     mock_invoke.assert_not_called()
     mock_insert.assert_not_called()
@@ -179,7 +184,7 @@ def test_resolve_high_stakes_llm_fallback_yes_writes_back_with_task_type():
     ):
         result = resolve_high_stakes("migrate the k8s cluster to a new region", _EMBEDDING, task_type="multi_step")
 
-    assert result is True
+    assert result == HighStakesResolution(is_high_stakes=True, source="llm_fallback")
     args, kwargs = mock_invoke.call_args
     assert args[1] == "haiku"
     assert kwargs["disable_tools"] is True
@@ -203,7 +208,7 @@ def test_resolve_high_stakes_llm_fallback_no_writes_back_false():
     ):
         result = resolve_high_stakes("what's a good design for this button?", _EMBEDDING)
 
-    assert result is False
+    assert result == HighStakesResolution(is_high_stakes=False, source="llm_fallback")
     mock_insert.assert_called_once_with(
         "what's a good design for this button?",
         _EMBEDDING,

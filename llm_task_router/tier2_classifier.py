@@ -101,6 +101,11 @@ class Tier2Resolution(NamedTuple):
     source: str  # "nn" | "llm_fallback"
 
 
+class HighStakesResolution(NamedTuple):
+    is_high_stakes: bool
+    source: str  # "nn" | "llm_fallback"
+
+
 def _nn_majority(matches: list[vector_store.NeighborMatch]) -> str | bool | None:
     """Returns the majority label among the given neighbors if enough of them
     agree, else None (not confident). No similarity floor - see
@@ -178,18 +183,23 @@ def resolve_task_type(description: str, embedding: list[float]) -> Tier2Resoluti
     return Tier2Resolution(task_type=label, source="llm_fallback")
 
 
-def resolve_high_stakes(description: str, embedding: list[float], *, task_type: str | None = None) -> bool | None:
+def resolve_high_stakes(
+    description: str, embedding: list[float], *, task_type: str | None = None
+) -> HighStakesResolution | None:
     """Same shape as resolve_task_type, against is_high_stakes-labeled
     neighbors. `task_type` is optional context to include in the write-back
     row when the caller already resolved it earlier in the same request -
     a richer row (both labels from one description) is strictly more useful
     than a high-stakes-only one, and costs nothing extra to include. Returns
     None on NN-unconfident + LLM-unavailable, same discipline as
-    resolve_task_type."""
+    resolve_task_type. Carries a `source` ("nn" | "llm_fallback"), the same
+    symmetry resolve_task_type already had - a drift-auditing consumer needs
+    to know which mechanism produced a live resolution, not just the
+    resolution itself."""
     matches = vector_store.nearest_neighbors(embedding, "is_high_stakes", k=NEIGHBOR_K)
     majority = _nn_majority(matches)
     if majority is not None:
-        return majority
+        return HighStakesResolution(is_high_stakes=majority, source="nn")
 
     is_high_stakes = _corroborate_high_stakes_via_llm(description)
     if is_high_stakes is None:
@@ -197,4 +207,4 @@ def resolve_high_stakes(description: str, embedding: list[float], *, task_type: 
     vector_store.insert_example(
         description, embedding, task_type=task_type, is_high_stakes=is_high_stakes, source="llm_fallback"
     )
-    return is_high_stakes
+    return HighStakesResolution(is_high_stakes=is_high_stakes, source="llm_fallback")

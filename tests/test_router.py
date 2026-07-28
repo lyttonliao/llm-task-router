@@ -3,6 +3,7 @@ from unittest.mock import patch
 from llm_task_router import tier2_classifier
 from llm_task_router.schema import ProviderResult, TaskRequest
 from llm_task_router.router import route, route_and_run
+from llm_task_router.tier2_classifier import HighStakesResolution
 
 
 def test_route_resolves_tier_and_provider_with_no_io():
@@ -69,7 +70,10 @@ def test_route_escalates_high_stakes_via_tier2_without_a_keyword_match():
     request = TaskRequest(description="design a scalable, fault-tolerant system for this workload")
     with (
         patch("llm_task_router.router.embeddings.embed", return_value=[0.1, 0.2]),
-        patch("llm_task_router.router.tier2_classifier.resolve_high_stakes", return_value=True) as mock_resolve,
+        patch(
+            "llm_task_router.router.tier2_classifier.resolve_high_stakes",
+            return_value=HighStakesResolution(is_high_stakes=True, source="llm_fallback"),
+        ) as mock_resolve,
     ):
         decision = route(request)
 
@@ -85,7 +89,10 @@ def test_route_caps_at_mid_when_tier2_corroboration_confirms_no_high_stakes():
     request = TaskRequest(description="design a scalable, fault-tolerant system for this workload")
     with (
         patch("llm_task_router.router.embeddings.embed", return_value=[0.1, 0.2]),
-        patch("llm_task_router.router.tier2_classifier.resolve_high_stakes", return_value=False),
+        patch(
+            "llm_task_router.router.tier2_classifier.resolve_high_stakes",
+            return_value=HighStakesResolution(is_high_stakes=False, source="llm_fallback"),
+        ),
     ):
         decision = route(request)
 

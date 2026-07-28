@@ -164,9 +164,9 @@ def route(request: TaskRequest) -> RouteDecision:
     embedding: list[float] | None = None
     if classification.task_type_source == "fallback":
         embedding = embeddings.embed(request.description)
-        tier2_resolution = tier2_classifier.resolve_task_type(request.description, embedding)
-        if tier2_resolution is not None:
-            resolved_task_type = tier2_resolution.task_type
+        tier2_task_type_resolution = tier2_classifier.resolve_task_type(request.description, embedding)
+        if tier2_task_type_resolution is not None:
+            resolved_task_type = tier2_task_type_resolution.task_type
             resolved_task_type_source = "tier2"
 
     no_signal = resolved_task_type_source == "fallback" and classification.domain_source == "fallback"
@@ -191,10 +191,10 @@ def route(request: TaskRequest) -> RouteDecision:
         if needs_corroboration and not has_high_stakes_signal(request.description):
             if embedding is None:
                 embedding = embeddings.embed(request.description)
-            tier2_high_stakes = tier2_classifier.resolve_high_stakes(
+            tier2_high_stakes_resolution = tier2_classifier.resolve_high_stakes(
                 request.description, embedding, task_type=resolved_task_type
             )
-            if tier2_high_stakes:
+            if tier2_high_stakes_resolution is not None and tier2_high_stakes_resolution.is_high_stakes:
                 bias = grid_bias
                 reason = (
                     f"heuristic grid said H for {resolved_task_type} x {classification.domain} "
@@ -208,7 +208,11 @@ def route(request: TaskRequest) -> RouteDecision:
                     f"(type {resolved_task_type_source}), but no high-stakes signal (production/"
                     "security/compliance/irreversibility/scale) was found in the description, and tier "
                     "2's continuous-learning classifier "
-                    + ("confirmed no genuine high stakes" if tier2_high_stakes is False else "was unavailable")
+                    + (
+                        "confirmed no genuine high stakes"
+                        if tier2_high_stakes_resolution is not None
+                        else "was unavailable"
+                    )
                     + " - capped at mid; flagship requires confirmed difficulty/consequence/ambiguity, "
                     "not just an inferred shape/domain match"
                 )
