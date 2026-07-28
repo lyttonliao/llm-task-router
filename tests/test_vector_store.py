@@ -11,7 +11,12 @@ from unittest.mock import patch
 import pytest
 from pgvector import Vector
 
-from llm_task_router.vector_store import NeighborMatch, insert_example, nearest_neighbors
+from llm_task_router.vector_store import (
+    NeighborMatch,
+    existing_descriptions,
+    insert_example,
+    nearest_neighbors,
+)
 
 _DATABASE_URL = "postgresql://test:test@localhost/test"
 
@@ -130,6 +135,42 @@ def test_nearest_neighbors_defaults_k_to_5():
 
     _query, params = fake_cursor.executed[0]
     assert params[2] == 5
+
+
+# --- existing_descriptions ------------------------------------------------
+
+
+def test_existing_descriptions_returns_set_of_descriptions_in_one_round_trip():
+    fake_cursor = _FakeCursor(fetchall_return=[("desc one",), ("desc two",)])
+    fake_conn = _FakeConnection(fake_cursor)
+    with (
+        _patched_env(),
+        patch("llm_task_router.vector_store.psycopg.connect", return_value=fake_conn) as mock_connect,
+        patch("llm_task_router.vector_store.register_vector") as mock_register,
+    ):
+        result = existing_descriptions()
+
+    mock_connect.assert_called_once_with(_DATABASE_URL)
+    mock_register.assert_called_once_with(fake_conn)
+    assert result == {"desc one", "desc two"}
+    assert len(fake_cursor.executed) == 1
+    query, params = fake_cursor.executed[0]
+    assert "SELECT description" in query
+    assert "FROM routing_examples" in query
+    assert params is None
+
+
+def test_existing_descriptions_empty_table_returns_empty_set():
+    fake_cursor = _FakeCursor(fetchall_return=[])
+    fake_conn = _FakeConnection(fake_cursor)
+    with (
+        _patched_env(),
+        patch("llm_task_router.vector_store.psycopg.connect", return_value=fake_conn),
+        patch("llm_task_router.vector_store.register_vector"),
+    ):
+        result = existing_descriptions()
+
+    assert result == set()
 
 
 # --- insert_example ------------------------------------------------------

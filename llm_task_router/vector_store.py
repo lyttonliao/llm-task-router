@@ -69,6 +69,17 @@ def nearest_neighbors(embedding: list[float], label_column: str, k: int = 5) -> 
     return [NeighborMatch(label=row[0], similarity=row[1]) for row in rows]
 
 
+def existing_descriptions() -> set[str]:
+    """Returns every `description` currently in `routing_examples`, fetched in
+    one round-trip. Used by seed_vector_store.py to dedupe a ~98-row seed
+    batch in Python rather than issuing one existence query per row."""
+    query = "SELECT description FROM routing_examples"
+    with _connect() as conn, conn.cursor() as cur:
+        cur.execute(query)
+        rows = cur.fetchall()
+    return {row[0] for row in rows}
+
+
 def insert_example(
     description: str,
     embedding: list[float],
