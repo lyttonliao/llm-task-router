@@ -35,6 +35,14 @@ class NeighborMatch(NamedTuple):
     similarity: float  # cosine similarity, higher = closer
 
 
+class LabeledExample(NamedTuple):
+    id: int
+    description: str
+    embedding: list[float]
+    label: str | bool
+    source: str
+
+
 def _database_url() -> str:
     url = os.environ.get("DATABASE_URL")
     if not url:
@@ -67,6 +75,30 @@ def nearest_neighbors(embedding: list[float], label_column: str, k: int = 5) -> 
         cur.execute(query, (vector, vector, k))
         rows = cur.fetchall()
     return [NeighborMatch(label=row[0], similarity=row[1]) for row in rows]
+
+
+def all_labeled_examples(label_column: str) -> list[LabeledExample]:
+    """Every row where `label_column` is non-null, embedding included. Used
+    by scripts/audit_tier2.py to re-run the leave-one-out agreement check
+    against the live store instead of the frozen 98-row seed set - a batch
+    analysis over the whole labeled set, so it fetches everything in one
+    round-trip and does the neighbor math in Python rather than issuing one
+    nearest_neighbors() query per row."""
+    if label_column not in VALID_LABEL_COLUMNS:
+        raise ValueError(f"label_column must be one of {VALID_LABEL_COLUMNS}, got {label_column!r}")
+
+    query = f"""
+        SELECT id, description, embedding, {label_column}, source
+        FROM routing_examples
+        WHERE {label_column} IS NOT NULL
+    """
+    with _connect() as conn, conn.cursor() as cur:
+        cur.execute(query)
+        rows = cur.fetchall()
+    return [
+        LabeledExample(id=row[0], description=row[1], embedding=list(row[2]), label=row[3], source=row[4])
+        for row in rows
+    ]
 
 
 def existing_descriptions() -> set[str]:

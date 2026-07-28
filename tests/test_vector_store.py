@@ -12,7 +12,9 @@ import pytest
 from pgvector import Vector
 
 from llm_task_router.vector_store import (
+    LabeledExample,
     NeighborMatch,
+    all_labeled_examples,
     existing_descriptions,
     insert_example,
     nearest_neighbors,
@@ -135,6 +137,68 @@ def test_nearest_neighbors_defaults_k_to_5():
 
     _query, params = fake_cursor.executed[0]
     assert params[2] == 5
+
+
+# --- all_labeled_examples --------------------------------------------------
+
+
+def test_all_labeled_examples_rejects_unknown_label_column_without_connecting():
+    with (
+        _patched_env(),
+        patch("llm_task_router.vector_store.psycopg.connect") as mock_connect,
+        patch("llm_task_router.vector_store.register_vector") as mock_register,
+    ):
+        with pytest.raises(ValueError, match="label_column"):
+            all_labeled_examples("not_a_real_column")
+
+    mock_connect.assert_not_called()
+    mock_register.assert_not_called()
+
+
+def test_all_labeled_examples_returns_every_row_with_embedding():
+    fake_cursor = _FakeCursor(
+        fetchall_return=[
+            (1, "write a function that validates emails", [0.1, 0.2, 0.3], "code_gen", "seed"),
+            (2, "migrate the payments DB with zero downtime", [0.4, 0.5, 0.6], "multi_step", "llm_fallback"),
+        ]
+    )
+    fake_conn = _FakeConnection(fake_cursor)
+    with (
+        _patched_env(),
+        patch("llm_task_router.vector_store.psycopg.connect", return_value=fake_conn) as mock_connect,
+        patch("llm_task_router.vector_store.register_vector") as mock_register,
+    ):
+        result = all_labeled_examples("task_type")
+
+    mock_connect.assert_called_once_with(_DATABASE_URL)
+    mock_register.assert_called_once_with(fake_conn)
+    assert result == [
+        LabeledExample(
+            id=1, description="write a function that validates emails", embedding=[0.1, 0.2, 0.3],
+            label="code_gen", source="seed",
+        ),
+        LabeledExample(
+            id=2, description="migrate the payments DB with zero downtime", embedding=[0.4, 0.5, 0.6],
+            label="multi_step", source="llm_fallback",
+        ),
+    ]
+    query, params = fake_cursor.executed[0]
+    assert "SELECT id, description, embedding, task_type, source" in query
+    assert "task_type IS NOT NULL" in query
+    assert params is None
+
+
+def test_all_labeled_examples_empty_store_returns_empty_list():
+    fake_cursor = _FakeCursor(fetchall_return=[])
+    fake_conn = _FakeConnection(fake_cursor)
+    with (
+        _patched_env(),
+        patch("llm_task_router.vector_store.psycopg.connect", return_value=fake_conn),
+        patch("llm_task_router.vector_store.register_vector"),
+    ):
+        result = all_labeled_examples("is_high_stakes")
+
+    assert result == []
 
 
 # --- existing_descriptions ------------------------------------------------
