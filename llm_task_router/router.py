@@ -16,7 +16,7 @@ lookup-then-ask-and-remember mechanism.
 
 from collections.abc import Callable
 
-from llm_task_router import embeddings, tier2_classifier
+from llm_task_router import decision_log, embeddings, tier2_classifier
 from llm_task_router.classifier import classify, classify_description, has_high_stakes_signal
 from llm_task_router.providers import claude_cli, codex_cli
 from llm_task_router.schema import ProviderResult, RouteDecision, TaskRequest
@@ -156,12 +156,24 @@ def route(request: TaskRequest) -> RouteDecision:
     marks resolved_task_type_source="tier2", which the no_signal check and
     needs_corroboration gate below both treat as "we have a real signal now,"
     same as "inferred" - not as another flavor of "fallback".
+
+    Decision logging, added for drift auditing: every call writes one row to
+    `routing_decisions` via decision_log.log_decision() - which mechanism
+    resolved task_type/high-stakes (heuristic/tier2_nn/tier2_llm_fallback/
+    keyword/unavailable), not just the final tier. This exists because
+    nothing previously recorded what route() actually decided on live
+    traffic - `tier2_classifier.AGREEMENT_THRESHOLD` was tuned only against
+    the 98-row seed set, with no way to re-validate it against real query
+    behavior (see decision_log.py and scripts/audit_tier2.py). Wrapped in
+    try/except: a logging failure must never break routing, same discipline
+    tier2_classifier's own Postgres/LLM calls already follow.
     """
     classification = classify_description(request.description, request.task_type, request.domain)
 
     resolved_task_type = classification.task_type
     resolved_task_type_source = classification.task_type_source
     embedding: list[float] | None = None
+    tier2_task_type_resolution: tier2_classifier.Tier2Resolution | None = None
     if classification.task_type_source == "fallback":
         embedding = embeddings.embed(request.description)
         tier2_task_type_resolution = tier2_classifier.resolve_task_type(request.description, embedding)
@@ -169,8 +181,13 @@ def route(request: TaskRequest) -> RouteDecision:
             resolved_task_type = tier2_task_type_resolution.task_type
             resolved_task_type_source = "tier2"
 
+    resolved_is_high_stakes: bool | None = None
+    high_stakes_source: str | None = None
+    no_signal_llm_used = False
+
     no_signal = resolved_task_type_source == "fallback" and classification.domain_source == "fallback"
     if no_signal:
+        no_signal_llm_used = True
         llm_bias = _classify_via_llm(request.description)
         if llm_bias is not None:
             bias = llm_bias
@@ -194,6 +211,11 @@ def route(request: TaskRequest) -> RouteDecision:
             tier2_high_stakes_resolution = tier2_classifier.resolve_high_stakes(
                 request.description, embedding, task_type=resolved_task_type
             )
+            if tier2_high_stakes_resolution is not None:
+                resolved_is_high_stakes = tier2_high_stakes_resolution.is_high_stakes
+                high_stakes_source = f"tier2_{tier2_high_stakes_resolution.source}"
+            else:
+                high_stakes_source = "unavailable"
             if tier2_high_stakes_resolution is not None and tier2_high_stakes_resolution.is_high_stakes:
                 bias = grid_bias
                 reason = (
@@ -218,6 +240,11 @@ def route(request: TaskRequest) -> RouteDecision:
                 )
         else:
             bias = grid_bias
+            if needs_corroboration:
+                # needs_corroboration True but we didn't take the tier-2 branch above means
+                # has_high_stakes_signal() short-circuited it - free keyword corroboration.
+                resolved_is_high_stakes = True
+                high_stakes_source = "keyword"
             reason = (
                 f"heuristic grid: {resolved_task_type} x {classification.domain} -> {bias} "
                 f"(type {resolved_task_type_source}, domain {classification.domain_source})"
@@ -225,6 +252,31 @@ def route(request: TaskRequest) -> RouteDecision:
 
     tier = TIER_BIAS[bias]
     provider, model = TIER_MODELS[tier]
+
+    logged_task_type_source = resolved_task_type_source
+    if tier2_task_type_resolution is not None:
+        logged_task_type_source = f"tier2_{tier2_task_type_resolution.source}"
+
+    try:
+        decision_log.log_decision(
+            request.description,
+            embedding,
+            resolved_task_type=resolved_task_type,
+            task_type_source=logged_task_type_source,
+            domain=classification.domain,
+            domain_source=classification.domain_source,
+            resolved_is_high_stakes=resolved_is_high_stakes,
+            high_stakes_source=high_stakes_source,
+            no_signal_llm_used=no_signal_llm_used,
+            bias=bias,
+            tier=tier,
+            provider=provider,
+            model=model,
+            reason=reason,
+        )
+    except Exception:
+        pass  # a logging failure must never break routing - see decision_log.py's module docstring
+
     return RouteDecision(tier=tier, provider=provider, model=model, reason=reason)
 
 

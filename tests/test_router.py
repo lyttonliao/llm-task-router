@@ -333,6 +333,122 @@ def test_route_uses_grid_normally_when_only_domain_axis_is_unresolved():
     assert "heuristic grid" in decision.reason
 
 
+# --- decision_log wiring ---------------------------------------------------
+# route() logs every decision for drift auditing (see router.py's docstring
+# and decision_log.py) - these assert the logged fields on a representative
+# sample of paths, using conftest.py's autouse `_noop_decision_log` fixture
+# explicitly so a signature bug in the log_decision() call isn't silently
+# swallowed by route()'s own try/except (which exists so a *real* Postgres
+# failure never breaks routing, not to hide a wiring bug from tests).
+
+
+def test_route_logs_pure_heuristic_decision_with_null_embedding(_noop_decision_log):
+    request = TaskRequest(description="fix null pointer in login form", task_type="triage", domain="frontend")
+    route(request)
+
+    _noop_decision_log.assert_called_once()
+    args, kwargs = _noop_decision_log.call_args
+    description, embedding = args
+    assert description == "fix null pointer in login form"
+    assert embedding is None  # no embeddings.embed() call on the pure-heuristic path
+    assert kwargs["resolved_task_type"] == "triage"
+    assert kwargs["task_type_source"] == "provided"
+    assert kwargs["resolved_is_high_stakes"] is None
+    assert kwargs["high_stakes_source"] is None
+    assert kwargs["no_signal_llm_used"] is False
+    assert kwargs["tier"] == "cheap"
+
+
+def test_route_logs_tier2_nn_task_type_source(_noop_decision_log):
+    request = TaskRequest(description="put together a plan for the quarterly numbers")
+    with (
+        patch("llm_task_router.router.embeddings.embed", return_value=[0.1, 0.2]),
+        patch(
+            "llm_task_router.router.tier2_classifier.resolve_task_type",
+            return_value=tier2_classifier.Tier2Resolution(task_type="code_gen", source="nn"),
+        ),
+        patch("llm_task_router.router.claude_cli.invoke") as mock_invoke,
+    ):
+        route(request)
+
+    mock_invoke.assert_not_called()
+    kwargs = _noop_decision_log.call_args.kwargs
+    assert kwargs["task_type_source"] == "tier2_nn"
+    assert kwargs["resolved_task_type"] == "code_gen"
+
+
+def test_route_logs_keyword_corroborated_high_stakes(_noop_decision_log):
+    request = TaskRequest(
+        description="design the multi-region disaster recovery strategy for our payment processing system, "
+        "given a strict compliance requirement"
+    )
+    route(request)
+
+    kwargs = _noop_decision_log.call_args.kwargs
+    assert kwargs["resolved_is_high_stakes"] is True
+    assert kwargs["high_stakes_source"] == "keyword"
+    assert kwargs["tier"] == "flagship"
+
+
+def test_route_logs_tier2_llm_fallback_high_stakes_source(_noop_decision_log):
+    request = TaskRequest(description="design a scalable, fault-tolerant system for this workload")
+    with (
+        patch("llm_task_router.router.embeddings.embed", return_value=[0.1, 0.2]),
+        patch(
+            "llm_task_router.router.tier2_classifier.resolve_high_stakes",
+            return_value=HighStakesResolution(is_high_stakes=True, source="llm_fallback"),
+        ),
+    ):
+        route(request)
+
+    kwargs = _noop_decision_log.call_args.kwargs
+    assert kwargs["resolved_is_high_stakes"] is True
+    assert kwargs["high_stakes_source"] == "tier2_llm_fallback"
+    assert kwargs["tier"] == "flagship"
+
+
+def test_route_logs_unavailable_high_stakes_source(_noop_decision_log):
+    request = TaskRequest(description="design a scalable, fault-tolerant system for this workload")
+    with (
+        patch("llm_task_router.router.embeddings.embed", return_value=[0.1, 0.2]),
+        patch("llm_task_router.router.tier2_classifier.resolve_high_stakes", return_value=None),
+    ):
+        route(request)
+
+    kwargs = _noop_decision_log.call_args.kwargs
+    assert kwargs["resolved_is_high_stakes"] is None
+    assert kwargs["high_stakes_source"] == "unavailable"
+    assert kwargs["tier"] == "mid"
+
+
+def test_route_logs_no_signal_llm_used(_noop_decision_log):
+    request = TaskRequest(description="repeat this word: hello")
+    with (
+        patch("llm_task_router.router.embeddings.embed", return_value=[0.0]),
+        patch("llm_task_router.router.tier2_classifier.resolve_task_type", return_value=None),
+        patch(
+            "llm_task_router.router.claude_cli.invoke",
+            return_value=ProviderResult(text="CHEAP", cost_usd=0.003, duration_ms=400),
+        ),
+    ):
+        route(request)
+
+    kwargs = _noop_decision_log.call_args.kwargs
+    assert kwargs["no_signal_llm_used"] is True
+    assert kwargs["tier"] == "cheap"
+
+
+def test_route_logging_failure_never_breaks_routing():
+    """A real Postgres/decision_log failure must degrade to 'no audit trail
+    for this call', never to a broken route - same discipline
+    tier2_classifier's own Postgres/LLM calls already follow."""
+    request = TaskRequest(description="fix null pointer in login form", task_type="triage", domain="frontend")
+    with patch("llm_task_router.router.decision_log.log_decision", side_effect=RuntimeError("DATABASE_URL not set")):
+        decision = route(request)
+
+    assert decision.tier == "cheap"
+
+
 def test_route_and_run_invokes_resolved_provider():
     request = TaskRequest(description="summarize this report", task_type="summarization", domain="other")
     fake_result = ProviderResult(text="summary here", cost_usd=0.001, duration_ms=200)
