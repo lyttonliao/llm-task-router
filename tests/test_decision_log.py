@@ -9,18 +9,22 @@ from unittest.mock import patch
 import pytest
 from pgvector import Vector
 
-from llm_task_router.decision_log import log_decision
+from llm_task_router.decision_log import LoggedDecision, fetch_decisions, log_decision
 
 _DATABASE_URL = "postgresql://test:test@localhost/test"
 
 
 class _FakeCursor:
-    def __init__(self):
+    def __init__(self, fetchall_result=None):
         self.executed = []
+        self._fetchall_result = fetchall_result or []
 
     def execute(self, query, params=None):
         self.executed.append((query, params))
         return self
+
+    def fetchall(self):
+        return self._fetchall_result
 
     def __enter__(self):
         return self
@@ -52,7 +56,9 @@ def test_log_decision_inserts_expected_row_with_embedding():
     fake_conn = _FakeConnection(fake_cursor)
     with (
         _patched_env(),
-        patch("llm_task_router.decision_log.psycopg.connect", return_value=fake_conn) as mock_connect,
+        patch(
+            "llm_task_router.decision_log.psycopg.connect", return_value=fake_conn
+        ) as mock_connect,
         patch("llm_task_router.decision_log.register_vector") as mock_register,
     ):
         log_decision(
@@ -70,6 +76,9 @@ def test_log_decision_inserts_expected_row_with_embedding():
             provider="claude",
             model="haiku",
             reason="heuristic grid: code_gen x None -> L (type inferred, domain fallback)",
+            shadow_bias="L",
+            shadow_tier="cheap",
+            shadow_reason="shadow (no tier 2): heuristic grid code_gen x None -> L",
         )
 
     mock_connect.assert_called_once_with(_DATABASE_URL)
@@ -92,6 +101,9 @@ def test_log_decision_inserts_expected_row_with_embedding():
         provider,
         model,
         reason,
+        shadow_bias,
+        shadow_tier,
+        shadow_reason,
     ) = params
     assert description == "write a function that validates emails"
     assert embedding_param == Vector([0.1, 0.2, 0.3])
@@ -107,6 +119,9 @@ def test_log_decision_inserts_expected_row_with_embedding():
     assert provider == "claude"
     assert model == "haiku"
     assert "heuristic grid" in reason
+    assert shadow_bias == "L"
+    assert shadow_tier == "cheap"
+    assert "shadow (no tier 2)" in shadow_reason
 
 
 def test_log_decision_null_embedding_for_pure_heuristic_path():
@@ -134,6 +149,9 @@ def test_log_decision_null_embedding_for_pure_heuristic_path():
             provider="claude",
             model="haiku",
             reason="heuristic grid: refactor x backend -> L (type inferred, domain inferred)",
+            shadow_bias="L",
+            shadow_tier="cheap",
+            shadow_reason="shadow (no tier 2): heuristic grid refactor x backend -> L",
         )
 
     _query, params = fake_cursor.executed[0]
@@ -163,15 +181,20 @@ def test_log_decision_records_tier2_and_high_stakes_sources():
             provider="claude",
             model="opus",
             reason="tier 2's continuous-learning classifier confirmed genuine high stakes",
+            shadow_bias="M",
+            shadow_tier="mid",
+            shadow_reason="shadow (no tier 2): heuristic grid said H, no keyword corroboration - capped at mid",
         )
 
     _query, params = fake_cursor.executed[0]
     resolved_is_high_stakes = params[6]
     high_stakes_source = params[7]
     task_type_source = params[3]
+    shadow_tier = params[15]
     assert task_type_source == "tier2_nn"
     assert resolved_is_high_stakes is True
     assert high_stakes_source == "tier2_llm_fallback"
+    assert shadow_tier == "mid"
 
 
 def test_database_url_missing_raises_runtime_error():
@@ -196,6 +219,81 @@ def test_database_url_missing_raises_runtime_error():
                 provider="claude",
                 model="haiku",
                 reason="test",
+                shadow_bias="L",
+                shadow_tier="cheap",
+                shadow_reason="test",
             )
+
+    mock_connect.assert_not_called()
+
+
+# --- fetch_decisions --------------------------------------------------------
+
+
+def test_fetch_decisions_returns_logged_decision_rows_in_order():
+    row = (
+        1,
+        "write a function that validates emails",
+        "code_gen",
+        "inferred",
+        None,
+        "fallback",
+        None,
+        None,
+        "L",
+        "cheap",
+        "claude",
+        "haiku",
+        "heuristic grid: code_gen x None -> L",
+        "L",
+        "cheap",
+        "shadow (no tier 2): heuristic grid code_gen x None -> L",
+    )
+    fake_cursor = _FakeCursor(fetchall_result=[row])
+    fake_conn = _FakeConnection(fake_cursor)
+    with (
+        _patched_env(),
+        patch(
+            "llm_task_router.decision_log.psycopg.connect", return_value=fake_conn
+        ) as mock_connect,
+        patch("llm_task_router.decision_log.register_vector"),
+    ):
+        decisions = fetch_decisions()
+
+    mock_connect.assert_called_once_with(_DATABASE_URL)
+    query, _params = fake_cursor.executed[0]
+    assert "SELECT" in query
+    assert "FROM routing_decisions" in query
+    assert "ORDER BY created_at ASC" in query
+    assert decisions == [
+        LoggedDecision(
+            id=1,
+            description="write a function that validates emails",
+            resolved_task_type="code_gen",
+            task_type_source="inferred",
+            domain=None,
+            domain_source="fallback",
+            resolved_is_high_stakes=None,
+            high_stakes_source=None,
+            bias="L",
+            tier="cheap",
+            provider="claude",
+            model="haiku",
+            reason="heuristic grid: code_gen x None -> L",
+            shadow_bias="L",
+            shadow_tier="cheap",
+            shadow_reason="shadow (no tier 2): heuristic grid code_gen x None -> L",
+        )
+    ]
+
+
+def test_fetch_decisions_database_url_missing_raises_runtime_error():
+    env_without_url = {k: v for k, v in os.environ.items() if k != "DATABASE_URL"}
+    with (
+        patch.dict(os.environ, env_without_url, clear=True),
+        patch("llm_task_router.decision_log.psycopg.connect") as mock_connect,
+    ):
+        with pytest.raises(RuntimeError, match="DATABASE_URL"):
+            fetch_decisions()
 
     mock_connect.assert_not_called()

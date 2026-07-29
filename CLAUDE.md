@@ -47,10 +47,12 @@ llm_task_router/
                     decision_log.py below
   tier2_classifier.py - tier-2 orchestration: NN lookup + cheap-LLM
                     fallback-with-write-back (see "Tier 2" below)
-  decision_log.py - drift auditing: the second (and, for now, final) module
-                    allowed to contain SQL - write-only routing_decisions
-                    log, one row per route() call (see "Drift auditing"
-                    below)
+  decision_log.py - drift auditing + shadow evaluation: the second (and,
+                    for now, final) module allowed to contain SQL -
+                    routing_decisions log, one row per route() call, each
+                    carrying both the real decision and a free tier-1-only
+                    shadow decision (see "Drift auditing" and "Shadow
+                    evaluation" below)
   db/schema.sql   - routing_examples + routing_decisions DDL, applied
                     manually via psql
   tiers.py        - tier name -> concrete (provider, model) mapping
@@ -214,6 +216,65 @@ draft called `list(row[2])` on the embedding column, assuming an iterable — a
 against the real store. Fixed with `Vector.to_list()`. Any future module
 reading embeddings back out of Postgres should expect the same and verify
 against a real query first.
+
+## Shadow evaluation: live dual-routing without doubling cost
+
+Built 2026-07-28, closing this file's last documented rough edge ("no live
+dual-routing — a request never goes to two tiers to compare"). Distinct from
+both drift auditing above (which re-validates tier 2's *own* NN/LLM
+resolutions against themselves) and `llm-eval-harness`'s offline calibration
+(a fixed 98-case golden set) — this compares tier 1 against tier 2 on live
+traffic, which is the actual open question blocking tier 1's eventual
+deprecation (see "The classifier" above).
+
+**Not a real second model invocation.** The obvious shape of "shadow
+evaluation" — actually calling a second model on every request and comparing
+outputs — would double real per-call cost for every single routed request,
+which contradicts this repo's cost discipline everywhere else (`_classify_via_llm`,
+`tier2_classifier`'s LLM fallback, all explicitly reasoned about
+dollars-per-call). Instead, `router._shadow_tier1_only_decision()` computes a
+second **routing decision**, not a second response: what tier the request
+would have gotten if tier 2 had never been consulted at all, using only data
+already computed for the real decision (`classification`, the grid, keyword
+high-stakes matching) — zero extra embedding calls, zero extra LLM calls,
+zero extra Postgres round-trips.
+
+**The no-signal case is a deliberate approximation, not a full replay.** The
+real no-signal branch (`_classify_via_llm`, tier 3) makes a genuine LLM call;
+re-invoking it a second time just to populate a shadow column would
+reintroduce the exact double-cost problem this design avoids. The shadow
+reading always hedges the no-signal case straight to `mid` instead — the same
+static fallback tier 3 itself uses on its own failure, so this is a
+defensible stand-in for "would have escalated," not a fabricated number.
+
+**`route()` logs both, acts on only one.** Every call computes
+`shadow_bias`/`shadow_tier`/`shadow_reason` alongside the real decision and
+passes both to `decision_log.log_decision()` — the shadow fields never touch
+`provider`/`model`/the returned `RouteDecision`, purely an audit-row column.
+`decision_log.py` gained `fetch_decisions()` (a `LoggedDecision` NamedTuple
+per row) to read the table back in batch, the same one-round-trip-then-
+analyze-in-Python shape `vector_store.all_labeled_examples()` already
+established.
+
+**`scripts/report_shadow_divergence.py`** reads the live table and reports:
+divergence rate (real tier vs. shadow tier), direction (`tiers.TIER_ORDER`
+now exists specifically for this — escalated = tier 2 routed more expensively
+than tier 1 alone would have; de-escalated = the reverse, e.g. tier 2
+correctly resolving a task_type the heuristic couldn't place, avoiding an
+unnecessary `mid` hedge), and which `tier2_classifier` axis (task_type
+resolution vs. high-stakes corroboration) drove each divergence. Deliberately
+does not judge which side was *right* — that needs a ground-truth label or a
+judge call this script doesn't make; it only measures how often and in which
+direction the two disagree, the input needed for an eventual tier-1
+deprecation call.
+
+**Migration note**: `db/schema.sql`'s `CREATE TABLE routing_decisions` now
+includes `shadow_bias`/`shadow_tier`/`shadow_reason` (nullable, for
+migration compatibility with rows logged before this existed). An existing
+live database needs the three commented `ALTER TABLE` statements at the
+bottom of that file run manually via `psql` — not applied automatically,
+same one-time/not-idempotent discipline the rest of that file already
+documents.
 
 ## Adding a provider
 
@@ -433,6 +494,9 @@ error; the point is failing fast and consistently.
   deliberately with the user (2026-07-26): one adapter, one behavior, rather
   than threading a cost-mode flag through both call paths.
 - ~~No shadow evaluation, no live dual-routing, no drift auditing~~ —
-  **closed 2026-07-28** for the auditing half (see "Drift auditing" above).
-  Still true: no live dual-routing (a request never goes to two tiers to
-  compare), and the audit script is manual/periodic, not self-correcting.
+  **closed 2026-07-28** for both halves (see "Drift auditing" and "Shadow
+  evaluation" above). Still true: both `audit_tier2.py` and
+  `report_shadow_divergence.py` are manual/periodic scripts, not
+  self-correcting or cron'd — nothing auto-adjusts `AGREEMENT_THRESHOLD` or
+  deprecates tier 1 based on what they report, a human still reads the
+  output and decides.

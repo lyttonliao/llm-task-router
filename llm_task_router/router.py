@@ -17,7 +17,11 @@ lookup-then-ask-and-remember mechanism.
 from collections.abc import Callable
 
 from llm_task_router import decision_log, embeddings, tier2_classifier
-from llm_task_router.classifier import classify, classify_description, has_high_stakes_signal
+from llm_task_router.classifier import (
+    classify,
+    classify_description,
+    has_high_stakes_signal,
+)
 from llm_task_router.providers import claude_cli, codex_cli
 from llm_task_router.schema import ProviderResult, RouteDecision, TaskRequest
 from llm_task_router.tiers import TIER_BIAS, TIER_MODELS
@@ -83,6 +87,57 @@ def _classify_via_llm(description: str) -> str | None:
     if "CHEAP" in text:
         return "L"
     return None
+
+
+def _shadow_tier1_only_decision(
+    classification, description: str
+) -> tuple[str, str, str]:
+    """What route() would decide for this exact request if tier 2 had never
+    been built - the pure heuristic-grid router, including the no-signal and
+    corroboration safety nets (both added independently of tier 2 - see
+    route()'s docstring - so they belong in this counterfactual too), but
+    with zero tier2_classifier calls. Logged alongside the real decision (see
+    decision_log.py) for shadow evaluation: measuring how often, and in which
+    direction, tier 2 actually changes the outcome on live traffic - the data
+    this repo's CLAUDE.md says is needed before tier 1 can ever be
+    deprecated, not a guess.
+
+    Deliberately does NOT re-invoke tier 3's no-signal LLM call to populate
+    this - that would mean a second real LLM call solely for a shadow log
+    column, which contradicts every other cost discipline in this module
+    (see _classify_via_llm's docstring). The no-signal case here always
+    hedges to the static "M" bias instead, the same fallback tier 3 itself
+    uses on failure - a defensible approximation of "would have escalated"
+    that costs nothing to compute, since every input (task_type_source,
+    domain_source, the grid, keyword high-stakes matching) is already
+    available on `classification` for free."""
+    if (
+        classification.task_type_source == "fallback"
+        and classification.domain_source == "fallback"
+    ):
+        return (
+            "M",
+            TIER_BIAS["M"],
+            "shadow (no tier 2): no keyword signal on either axis, hedged to mid",
+        )
+
+    grid_bias = classify(classification.task_type, classification.domain)
+    needs_corroboration = (
+        grid_bias == "H" and classification.task_type_source != "provided"
+    )
+    if needs_corroboration and not has_high_stakes_signal(description):
+        reason = (
+            f"shadow (no tier 2): heuristic grid said H for {classification.task_type} x "
+            f"{classification.domain} (type {classification.task_type_source}), no keyword corroboration - "
+            "capped at mid"
+        )
+        return "M", TIER_BIAS["M"], reason
+
+    reason = (
+        f"shadow (no tier 2): heuristic grid {classification.task_type} x {classification.domain} -> "
+        f"{grid_bias} (type {classification.task_type_source}, domain {classification.domain_source})"
+    )
+    return grid_bias, TIER_BIAS[grid_bias], reason
 
 
 def route(request: TaskRequest) -> RouteDecision:
@@ -167,8 +222,29 @@ def route(request: TaskRequest) -> RouteDecision:
     behavior (see decision_log.py and scripts/audit_tier2.py). Wrapped in
     try/except: a logging failure must never break routing, same discipline
     tier2_classifier's own Postgres/LLM calls already follow.
+
+    Shadow evaluation, added for live dual-routing (closing this repo's last
+    documented rough edge - "no live dual-routing, a request never goes to
+    two tiers to compare"): every call also computes, and logs alongside the
+    real decision, what tier-1-alone (_shadow_tier1_only_decision(), no tier
+    2 consulted at all) would have decided for the same request - never
+    acted on, never affecting `provider`/`model`/the returned RouteDecision,
+    purely a second column on the same audit row. This is genuinely free:
+    the shadow function only reads `classification`, which is computed once
+    above and never mutated by the tier-2 branches below (they reassign
+    local `resolved_*` variables, not `classification` itself), so there is
+    no second embedding call, no second LLM call, no second Postgres
+    round-trip - just a second reading of data already in hand. See
+    scripts/report_shadow_divergence.py for what this data is for: measuring
+    how often and in which direction tier 2 changes the outcome, ahead of
+    ever using that to decide whether tier 1 can be deprecated.
     """
-    classification = classify_description(request.description, request.task_type, request.domain)
+    classification = classify_description(
+        request.description, request.task_type, request.domain
+    )
+    shadow_bias, shadow_tier, shadow_reason = _shadow_tier1_only_decision(
+        classification, request.description
+    )
 
     resolved_task_type = classification.task_type
     resolved_task_type_source = classification.task_type_source
@@ -176,7 +252,9 @@ def route(request: TaskRequest) -> RouteDecision:
     tier2_task_type_resolution: tier2_classifier.Tier2Resolution | None = None
     if classification.task_type_source == "fallback":
         embedding = embeddings.embed(request.description)
-        tier2_task_type_resolution = tier2_classifier.resolve_task_type(request.description, embedding)
+        tier2_task_type_resolution = tier2_classifier.resolve_task_type(
+            request.description, embedding
+        )
         if tier2_task_type_resolution is not None:
             resolved_task_type = tier2_task_type_resolution.task_type
             resolved_task_type_source = "tier2"
@@ -185,7 +263,10 @@ def route(request: TaskRequest) -> RouteDecision:
     high_stakes_source: str | None = None
     no_signal_llm_used = False
 
-    no_signal = resolved_task_type_source == "fallback" and classification.domain_source == "fallback"
+    no_signal = (
+        resolved_task_type_source == "fallback"
+        and classification.domain_source == "fallback"
+    )
     if no_signal:
         no_signal_llm_used = True
         llm_bias = _classify_via_llm(request.description)
@@ -204,7 +285,9 @@ def route(request: TaskRequest) -> RouteDecision:
             )
     else:
         grid_bias = classify(resolved_task_type, classification.domain)
-        needs_corroboration = grid_bias == "H" and resolved_task_type_source != "provided"
+        needs_corroboration = (
+            grid_bias == "H" and resolved_task_type_source != "provided"
+        )
         if needs_corroboration and not has_high_stakes_signal(request.description):
             if embedding is None:
                 embedding = embeddings.embed(request.description)
@@ -216,7 +299,10 @@ def route(request: TaskRequest) -> RouteDecision:
                 high_stakes_source = f"tier2_{tier2_high_stakes_resolution.source}"
             else:
                 high_stakes_source = "unavailable"
-            if tier2_high_stakes_resolution is not None and tier2_high_stakes_resolution.is_high_stakes:
+            if (
+                tier2_high_stakes_resolution is not None
+                and tier2_high_stakes_resolution.is_high_stakes
+            ):
                 bias = grid_bias
                 reason = (
                     f"heuristic grid said H for {resolved_task_type} x {classification.domain} "
@@ -273,6 +359,9 @@ def route(request: TaskRequest) -> RouteDecision:
             provider=provider,
             model=model,
             reason=reason,
+            shadow_bias=shadow_bias,
+            shadow_tier=shadow_tier,
+            shadow_reason=shadow_reason,
         )
     except Exception:
         pass  # a logging failure must never break routing - see decision_log.py's module docstring
@@ -296,5 +385,10 @@ def route_and_run(
     if on_decision:
         on_decision(decision)
     provider = PROVIDERS[decision.provider]
-    result = provider.invoke(request.description, decision.model, session_id=request.session_id, on_event=on_event)
+    result = provider.invoke(
+        request.description,
+        decision.model,
+        session_id=request.session_id,
+        on_event=on_event,
+    )
     return decision, result

@@ -43,7 +43,24 @@ CREATE TABLE routing_decisions (
     provider TEXT NOT NULL,
     model TEXT NOT NULL,
     reason TEXT NOT NULL,
+    -- Shadow evaluation (see router.py's _shadow_tier1_only_decision() and
+    -- scripts/report_shadow_divergence.py): what tier 1 alone, with zero
+    -- tier2_classifier calls, would have decided for this same request.
+    -- Never acted on - bias/tier/provider/model above are still what
+    -- actually served the request. Nullable for migration compatibility
+    -- with the ALTER TABLE below; every row logged after this column
+    -- existed always populates it (see decision_log.log_decision()).
+    shadow_bias TEXT,
+    shadow_tier TEXT,
+    shadow_reason TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE INDEX routing_decisions_created_at ON routing_decisions (created_at);
+
+-- Migration for an existing live routing_decisions table created before
+-- shadow evaluation was added (2026-07-28) - run this instead of the
+-- CREATE TABLE above against a database that already has the table.
+-- ALTER TABLE routing_decisions ADD COLUMN shadow_bias TEXT;
+-- ALTER TABLE routing_decisions ADD COLUMN shadow_tier TEXT;
+-- ALTER TABLE routing_decisions ADD COLUMN shadow_reason TEXT;
