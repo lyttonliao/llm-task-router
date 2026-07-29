@@ -195,7 +195,7 @@ autouse-patches `log_decision` to a no-op for the whole suite; a handful of
 `test_router.py` tests override it explicitly to assert logged fields on
 representative paths.
 
-**`scripts/audit_tier2.py`** re-runs the same leave-one-out methodology
+**`audit_tier2.py`** re-runs the same leave-one-out methodology
 against the *live* `routing_examples` table (via
 `vector_store.all_labeled_examples()`) instead of the frozen seed, printing
 the same kind of agreement curve plus a "threshold holds / consider raising"
@@ -206,8 +206,9 @@ LLM opinion per flagged row (same call shape as tier 2's own fallback).
 Verified against the real local store: 101 `task_type` rows produced a live
 curve (73.3%/79.0%/88.2%/100.0%) tracking the original seed-only numbers,
 verdict "holds," 0 suspect rows; `is_high_stakes` (3 rows) correctly reported
-"not enough rows yet." Manual/periodic, like `seed_vector_store.py` — no cron
-wired up yet.
+"not enough rows yet." Originally manual/periodic like `seed_vector_store.py`
+— now packaged as an installable console script and cron/launchd-schedulable,
+see "Scheduling audits" below.
 
 **Gotcha worth restating**: `vector_store.all_labeled_examples()`'s first
 draft called `list(row[2])` on the embedding column, assuming an iterable — a
@@ -256,7 +257,7 @@ per row) to read the table back in batch, the same one-round-trip-then-
 analyze-in-Python shape `vector_store.all_labeled_examples()` already
 established.
 
-**`scripts/report_shadow_divergence.py`** reads the live table and reports:
+**`report_shadow_divergence.py`** reads the live table and reports:
 divergence rate (real tier vs. shadow tier), direction (`tiers.TIER_ORDER`
 now exists specifically for this — escalated = tier 2 routed more expensively
 than tier 1 alone would have; de-escalated = the reverse, e.g. tier 2
@@ -275,6 +276,68 @@ live database needs the three commented `ALTER TABLE` statements at the
 bottom of that file run manually via `psql` — not applied automatically,
 same one-time/not-idempotent discipline the rest of that file already
 documents.
+
+## Scheduling audits
+
+Built 2026-07-28. `audit_tier2.py` and `report_shadow_divergence.py`
+originally lived under `scripts/` as loose dev-only files — confirmed via
+`uv build --wheel` that `scripts/` never shipped in the built wheel, so
+anyone installing this as a published package (not working from a git
+checkout) had no way to run either one. Both moved into the `llm_task_router`
+package proper and got real `[project.scripts]` entries in `pyproject.toml`:
+`llm-route-audit-tier2` and `llm-route-shadow-report`, alongside the existing
+`llm-route`/`llm-chat` pattern. `scripts/seed_vector_store.py` deliberately
+stayed put — a one-time cold-start operation, not something meant to run on
+a schedule.
+
+Neither script writes anything or auto-corrects anything (see "Drift
+auditing"/"Shadow evaluation" above) — they only print a report a human
+reads. Neither has an explicit exit-code contract either: a genuine failure
+(unset `DATABASE_URL`, DB connection error) surfaces as an uncaught exception
+and a nonzero exit already, for free; a "consider raising" verdict or a high
+divergence rate still exits 0, since that's a judgment call for the human
+reading the log, not a failure condition — a scheduler should alert on
+"job crashed," never on "job ran and found something worth reading."
+
+Example recipes (generic — adapt paths/venv for your own install, not tied
+to any one machine):
+
+```cron
+# crontab -e
+0 6 * * * DATABASE_URL=postgresql:///llm_task_router /path/to/venv/bin/llm-route-audit-tier2 >> /path/to/logs/audit_tier2.log 2>&1
+15 6 * * * DATABASE_URL=postgresql:///llm_task_router /path/to/venv/bin/llm-route-shadow-report >> /path/to/logs/shadow_report.log 2>&1
+```
+
+```xml
+<!-- ~/Library/LaunchAgents/com.llm-task-router.audit-tier2.plist (macOS) -->
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.llm-task-router.audit-tier2</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/path/to/venv/bin/llm-route-audit-tier2</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>DATABASE_URL</key><string>postgresql:///llm_task_router</string>
+    </dict>
+    <key>StartCalendarInterval</key>
+    <dict><key>Hour</key><integer>6</integer><key>Minute</key><integer>0</integer></dict>
+    <key>StandardOutPath</key><string>/path/to/logs/audit_tier2.log</string>
+    <key>StandardErrorPath</key><string>/path/to/logs/audit_tier2.log</string>
+</dict>
+</plist>
+```
+
+(`report_shadow_divergence.py`'s launchd job is the same shape, swapping in
+`llm-route-shadow-report` and a different log path/label.) Daily was chosen
+over weekly to track drift/divergence trends while `routing_decisions` is
+still accumulating from day-to-day `llm-chat`/`llm-route` usage. Neither
+recipe is wired up on any specific machine as part of this change — the
+point is a portable pattern any installer of this library can adopt, not a
+personal cron job for one dev box.
 
 ## Adding a provider
 
@@ -495,8 +558,10 @@ error; the point is failing fast and consistently.
   than threading a cost-mode flag through both call paths.
 - ~~No shadow evaluation, no live dual-routing, no drift auditing~~ —
   **closed 2026-07-28** for both halves (see "Drift auditing" and "Shadow
-  evaluation" above). Still true: both `audit_tier2.py` and
-  `report_shadow_divergence.py` are manual/periodic scripts, not
-  self-correcting or cron'd — nothing auto-adjusts `AGREEMENT_THRESHOLD` or
-  deprecates tier 1 based on what they report, a human still reads the
-  output and decides.
+  evaluation" above). ~~Both `audit_tier2.py` and `report_shadow_divergence.py`
+  are manual/periodic scripts, not... cron'd~~ — **closed 2026-07-28**, see
+  "Scheduling audits" above: both are now packaged console scripts with a
+  documented cron/launchd recipe. Still true: nothing auto-adjusts
+  `AGREEMENT_THRESHOLD` or deprecates tier 1 based on what they report — cron
+  only automates the *running*, not the judgment; a human still reads the
+  log and decides.

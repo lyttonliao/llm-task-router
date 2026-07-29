@@ -24,7 +24,7 @@ decision_log.py raises RuntimeError on its own the first time it needs a
 connection, so that check isn't duplicated here.
 
 Usage:
-    DATABASE_URL=postgresql:///llm_task_router uv run python scripts/report_shadow_divergence.py
+    DATABASE_URL=postgresql:///llm_task_router uv run llm-route-shadow-report
 """
 
 from collections import Counter

@@ -219,7 +219,7 @@ def route(request: TaskRequest) -> RouteDecision:
     nothing previously recorded what route() actually decided on live
     traffic - `tier2_classifier.AGREEMENT_THRESHOLD` was tuned only against
     the 98-row seed set, with no way to re-validate it against real query
-    behavior (see decision_log.py and scripts/audit_tier2.py). Wrapped in
+    behavior (see decision_log.py and audit_tier2.py). Wrapped in
     try/except: a logging failure must never break routing, same discipline
     tier2_classifier's own Postgres/LLM calls already follow.
 
@@ -235,7 +235,7 @@ def route(request: TaskRequest) -> RouteDecision:
     local `resolved_*` variables, not `classification` itself), so there is
     no second embedding call, no second LLM call, no second Postgres
     round-trip - just a second reading of data already in hand. See
-    scripts/report_shadow_divergence.py for what this data is for: measuring
+    report_shadow_divergence.py for what this data is for: measuring
     how often and in which direction tier 2 changes the outcome, ahead of
     ever using that to decide whether tier 1 can be deprecated.
     """

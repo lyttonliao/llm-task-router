@@ -12,6 +12,8 @@ dependencies = [
 [project.scripts]
 llm-route = "llm_task_router.cli:main"
 llm-chat = "llm_task_router.repl:main"
+llm-route-audit-tier2 = "llm_task_router.audit_tier2:main"
+llm-route-shadow-report = "llm_task_router.report_shadow_divergence:main"
 
 [build-system]
 requires = ["uv_build>=0.8.3,<0.9.0"]

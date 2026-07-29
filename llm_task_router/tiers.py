@@ -17,6 +17,6 @@ TIER_MODELS: dict[str, tuple[str, str]] = {
 }
 
 # Ordering, not identity - used to tell whether one tier is more/less
-# expensive than another (e.g. scripts/report_shadow_divergence.py comparing
+# expensive than another (e.g. report_shadow_divergence.py comparing
 # a real decision's tier against router.py's tier-1-only shadow tier).
 TIER_ORDER: dict[str, int] = {"cheap": 0, "mid": 1, "flagship": 2}

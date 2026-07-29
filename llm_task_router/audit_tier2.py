@@ -18,9 +18,9 @@ seed_vector_store.py - vector_store.py raises RuntimeError on its own the
 first time it needs a connection, so that check isn't duplicated here.
 
 Usage:
-    DATABASE_URL=postgresql:///llm_task_router uv run python scripts/audit_tier2.py
-    DATABASE_URL=... uv run python scripts/audit_tier2.py --label-column task_type
-    DATABASE_URL=... uv run python scripts/audit_tier2.py --judge-flagged
+    DATABASE_URL=postgresql:///llm_task_router uv run llm-route-audit-tier2
+    DATABASE_URL=... uv run llm-route-audit-tier2 --label-column task_type
+    DATABASE_URL=... uv run llm-route-audit-tier2 --judge-flagged
 """
 
 import argparse

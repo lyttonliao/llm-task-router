@@ -79,7 +79,7 @@ def nearest_neighbors(embedding: list[float], label_column: str, k: int = 5) -> 
 
 def all_labeled_examples(label_column: str) -> list[LabeledExample]:
     """Every row where `label_column` is non-null, embedding included. Used
-    by scripts/audit_tier2.py to re-run the leave-one-out agreement check
+    by audit_tier2.py to re-run the leave-one-out agreement check
     against the live store instead of the frozen 98-row seed set - a batch
     analysis over the whole labeled set, so it fetches everything in one
     round-trip and does the neighbor math in Python rather than issuing one

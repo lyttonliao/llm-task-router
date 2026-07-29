@@ -1,6 +1,6 @@
 """Drift-auditing and shadow-evaluation decision log for the router (see
-`db/schema.sql`'s `routing_decisions` table, `scripts/audit_tier2.py` and
-`scripts/report_shadow_divergence.py`, which both read it back via
+`db/schema.sql`'s `routing_decisions` table, `audit_tier2.py` and
+`report_shadow_divergence.py`, which both read it back via
 `fetch_decisions()` below).
 
 This is the second (and, for now, final) module allowed to contain SQL -
@@ -8,7 +8,7 @@ This is the second (and, for now, final) module allowed to contain SQL -
 `routing_examples`. The two are kept separate on purpose: `vector_store.py`
 is a read/write nearest-neighbor store consulted mid-request by
 `tier2_classifier.py`; this module is an audit trail appended to once per
-`route()` call and read back in batch by offline scripts (`audit_tier2.py`,
+`route()` call and read back in batch by offline entry points (`audit_tier2.py`,
 `report_shadow_divergence.py`) - never consulted mid-request the way
 `vector_store.py` is, a different concern even though both hit the same
 Postgres instance. (No longer strictly write-only as of
@@ -101,7 +101,7 @@ def log_decision(
     tier 2 consulted) would have decided for this same request - see
     router.py's `_shadow_tier1_only_decision()`. Purely descriptive: this
     row's `bias`/`tier`/`provider`/`model` are still what actually served
-    the request. `scripts/report_shadow_divergence.py` reads these back to
+    the request. `report_shadow_divergence.py` reads these back to
     measure how often, and in which direction, tier 2 changes the outcome."""
     query = """
         INSERT INTO routing_decisions (
@@ -140,8 +140,8 @@ def log_decision(
 
 def fetch_decisions() -> list[LoggedDecision]:
     """Every row in routing_decisions, oldest first. Used by
-    scripts/report_shadow_divergence.py (and available to audit_tier2.py-style
-    scripts generally) for a batch read over the whole live audit trail -
+    report_shadow_divergence.py (and available to audit_tier2.py-style
+    entry points generally) for a batch read over the whole live audit trail -
     same one-round-trip-then-analyze-in-Python shape as
     vector_store.all_labeled_examples(), for the same reason: this is an
     offline analysis over the full table, not a per-row lookup."""
