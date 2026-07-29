@@ -326,8 +326,8 @@ divergence rate still exits 0, since that's a judgment call for the human
 reading the log, not a failure condition — a scheduler should alert on
 "job crashed," never on "job ran and found something worth reading."
 
-Example recipes (generic — adapt paths/venv for your own install, not tied
-to any one machine):
+Example recipes for all three major platforms (generic — adapt paths/venv
+for your own install, not tied to any one machine):
 
 ```cron
 # crontab -e
@@ -359,12 +359,31 @@ to any one machine):
 ```
 
 (`report_shadow_divergence.py`'s launchd job is the same shape, swapping in
-`llm-route-shadow-report` and a different log path/label.) Daily was chosen
-over weekly to track drift/divergence trends while `routing_decisions` is
-still accumulating from day-to-day `llm-chat`/`llm-route` usage. Neither
-recipe is wired up on any specific machine as part of this change — the
-point is a portable pattern any installer of this library can adopt, not a
-personal cron job for one dev box.
+`llm-route-shadow-report` and a different log path/label.)
+
+```bat
+:: Windows, via Task Scheduler (schtasks) - staggered 06:00 / 06:15 to match
+schtasks /create /sc daily /st 06:00 /tn "llm-route-audit-tier2" /tr "C:\path\to\logs\run_audit_tier2.bat"
+schtasks /create /sc daily /st 06:15 /tn "llm-route-shadow-report" /tr "C:\path\to\logs\run_shadow_report.bat"
+```
+
+`schtasks`' `/tr` argument doesn't reliably support shell redirection
+operators (`>>`) inline, so each `/tr` target should be a small wrapper
+`.bat` file that sets `DATABASE_URL` and redirects output itself, e.g.
+`run_audit_tier2.bat`:
+
+```bat
+@echo off
+set DATABASE_URL=postgresql:///llm_task_router
+"C:\path\to\venv\Scripts\llm-route-audit-tier2.exe" >> "C:\path\to\logs\audit_tier2.log" 2>&1
+```
+
+Daily was chosen over weekly, on all three platforms, to track
+drift/divergence trends while `routing_decisions` is still accumulating
+from day-to-day `llm-chat`/`llm-route` usage. None of these three recipes
+is wired up on any specific machine as part of this change — the point is
+a portable pattern any installer of this library can adopt on whichever OS
+they're on, not a personal cron/launchd/Task Scheduler job for one dev box.
 
 ## Adding a provider
 
