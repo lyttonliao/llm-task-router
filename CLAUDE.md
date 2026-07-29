@@ -5,6 +5,33 @@ that clears a quality floor for that task category, then actually run it.
 The live-routing counterpart to `llm-eval-harness`, which benchmarks
 prompt/model quality offline to calibrate the tiers this router picks from.
 
+## Next step (updated 2026-07-28)
+
+Shadow evaluation landed, then `audit_tier2.py`/`report_shadow_divergence.py`
+got packaged as real console scripts (`llm-route-audit-tier2`,
+`llm-route-shadow-report`) with a documented cron/launchd recipe — see
+"Scheduling audits". Nothing is actually scheduled on any machine yet as
+part of that change; it's a documented, portable recipe for whoever installs
+this. Candidates for what comes next, ranked:
+
+1. **Actually wire the cron/launchd job on a real machine** and let
+   `routing_decisions` accumulate real shadow-comparison data — the whole
+   point of shadow eval was gathering "the data needed before tier 1's
+   heuristic grid can ever be deprecated" (see "The classifier"), and right
+   now there's only 1 real shadow-scored row logged locally (confirmed via
+   `llm-route-shadow-report`) — nowhere near enough to draw a conclusion.
+2. **Codex tier calibration** (separate, unrelated thread) — re-probe
+   reachable Codex models and run `llm-eval-harness`'s `calibrate-tier` skill
+   to see if any now clears haiku's quality floor, unblocking a second
+   provider in `tiers.TIER_MODELS`. Deferred once already in favor of the
+   cron work above (2026-07-28 conversation).
+3. Lower priority, explicitly parked in "Known rough edges" below: plan-mode
+   for `llm-chat`, Windows `select()` support, cross-provider session
+   continuity.
+
+Don't re-derive this by re-reading the whole file — start here, then jump to
+the referenced section only if you need the full backstory.
+
 ## Why it's built this way
 
 - **Subscription CLIs, not API keys.** Every provider call shells out to a
