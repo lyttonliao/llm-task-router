@@ -12,8 +12,18 @@ renderer, and was explicitly rejected as a design direction for this repo
 (see CLAUDE.md, "llm-chat: interactive terminal client" - a raw PTY takeover
 of a live `claude` session was considered and rejected as more fragile than
 the current mechanism).
+
+Colors/bold/dim are gated behind ansi_enabled() (NO_COLOR env var, isatty()
+check) so a piped/logged transcript never fills up with escape-code bytes -
+but bullets, the thinking glyph, and blank-line spacing always render
+regardless, so the transcript stays structurally readable either way. The
+"grayed out" thinking status uses DIM rather than a hardcoded gray color:
+DIM already reads as muted in effectively every terminal emulator and,
+unlike a fixed 256-color code, stays legible across both light and dark
+terminal themes.
 """
 
+import os
 import sys
 from collections.abc import Callable
 
@@ -23,41 +33,65 @@ BOLD = "\x1b[1m"
 
 CLAUDE_COLOR = "\x1b[38;5;208m"  # orange
 CODEX_COLOR = "\x1b[38;5;36m"  # teal
-TOOL_COLOR = "\x1b[38;5;178m"  # amber
+TEXT_COLOR = "\x1b[38;5;255m"  # near-white, for Claude's own text/reasoning bullet
+TOOL_COLOR = "\x1b[38;5;34m"  # green, for a running tool call
 ERROR_COLOR = "\x1b[38;5;196m"  # red
 
 PROVIDER_COLORS = {"claude": CLAUDE_COLOR, "codex": CODEX_COLOR}
 
 BULLET = "⏺"
+THINKING_GLYPH = "*"
+
+
+def ansi_enabled() -> bool:
+    """Per no-color.org: NO_COLOR present (any value) disables styling
+    outright; otherwise styling is enabled only when stdout is a real
+    terminal, never when piping to a file/log. Recomputed on every call, not
+    cached at import - the cost (one env lookup + one isatty() syscall) is
+    negligible next to a single provider subprocess call per message, and
+    caching would freeze a stale answer for the life of the process (and
+    make this untestable via monkeypatch)."""
+    if os.environ.get("NO_COLOR") is not None:
+        return False
+    return sys.stdout.isatty()
+
+
+def style(code: str) -> str:
+    """Gates one raw SGR code (BOLD/DIM/*_COLOR/RESET) behind
+    ansi_enabled(). Structure - BULLET, THINKING_GLYPH, divider rule,
+    blank-line spacing - is never routed through this: a piped/logged
+    transcript should stay readable and greppable, only escape-code bytes
+    are stripped."""
+    return code if ansi_enabled() else ""
 
 
 def provider_color(provider: str) -> str:
-    return PROVIDER_COLORS.get(provider, "")
+    return style(PROVIDER_COLORS.get(provider, ""))
 
 
 def prompt() -> str:
-    return f"{BOLD}you>{RESET} "
+    return f"{style(BOLD)}you>{style(RESET)} "
 
 
 def header(decision) -> str:
     color = provider_color(decision.provider)
-    return f"{color}{BOLD}[{decision.provider}/{decision.model}, tier={decision.tier}]{RESET}"
+    return f"{color}{style(BOLD)}[{decision.provider}/{decision.model}, tier={decision.tier}]{style(RESET)}"
 
 
 def error_line(error: str) -> str:
-    return f"{ERROR_COLOR}error: {error}{RESET}"
+    return f"{style(ERROR_COLOR)}error: {error}{style(RESET)}"
 
 
 def footer(result) -> str:
-    return f"{DIM}(cost ${result.cost_usd:.4f}, {result.duration_ms}ms){RESET}"
+    return f"{style(DIM)}(cost ${result.cost_usd:.4f}, {result.duration_ms}ms){style(RESET)}"
 
 
 def tool_line(name: str) -> str:
-    return f"{TOOL_COLOR}{BULLET} {name}{RESET}"
+    return f"{style(TOOL_COLOR)}{BULLET} {name}{style(RESET)}"
 
 
 def thinking_status() -> str:
-    return f"{DIM}✻ thinking…{RESET}"
+    return f"{style(DIM)}{THINKING_GLYPH} thinking…{style(RESET)}"
 
 
 def default_write(text: str) -> None:

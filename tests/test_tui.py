@@ -1,4 +1,20 @@
+import sys
+
+import pytest
+
 from llm_task_router import tui
+
+
+@pytest.fixture(autouse=True)
+def _simulate_interactive_terminal(monkeypatch):
+    """This file's existing tests assert the *styled* rendering path -
+    simulate a real interactive terminal so tui.ansi_enabled() is True by
+    default (sys.stdout.isatty() is False under pytest's captured stdout,
+    which would otherwise silently strip every color assertion below).
+    The NO_COLOR/non-tty tests further down override these two knobs
+    locally to exercise the stripping path instead."""
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
 
 
 def _writer():
@@ -95,3 +111,56 @@ def test_format_response_helpers_wrap_provider_color():
     assert tui.CLAUDE_COLOR in out
     assert "[claude/opus, tier=flagship]" in out
     assert tui.RESET in out
+
+
+def test_thinking_status_uses_literal_asterisk_not_the_old_unicode_star():
+    out = tui.thinking_status()
+
+    assert "*" in out
+    assert "✻" not in out
+
+
+def test_ansi_enabled_true_by_default_in_this_suite():
+    assert tui.ansi_enabled() is True
+
+
+def test_ansi_enabled_false_when_NO_COLOR_set(monkeypatch):
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    assert tui.ansi_enabled() is False
+
+
+def test_ansi_enabled_false_when_stdout_not_a_tty(monkeypatch):
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: False)
+
+    assert tui.ansi_enabled() is False
+
+
+def test_style_returns_empty_string_when_ansi_disabled(monkeypatch):
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    assert tui.style(tui.BOLD) == ""
+
+
+def test_tool_line_strips_color_but_keeps_bullet_and_name_when_no_color_set(monkeypatch):
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    out = tui.tool_line("Read")
+
+    assert tui.TOOL_COLOR not in out
+    assert tui.RESET not in out
+    assert tui.BULLET in out
+    assert "Read" in out
+
+
+def test_header_strips_color_but_keeps_text_when_not_a_tty(monkeypatch):
+    from llm_task_router.schema import RouteDecision
+
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: False)
+    decision = RouteDecision(tier="flagship", provider="claude", model="opus", reason="r")
+
+    out = tui.header(decision)
+
+    assert tui.CLAUDE_COLOR not in out
+    assert tui.BOLD not in out
+    assert "[claude/opus, tier=flagship]" in out
