@@ -109,19 +109,19 @@ def routable_tiers(authenticated_providers: set[str], tier_models: dict = TIER_M
 
 
 def print_startup_summary(authenticated_providers: set[str], routable: dict, unroutable: dict, *, print_fn=print) -> None:
-    print_fn(f"\n{tui.DIM}Authenticated providers:{tui.RESET}")
+    print_fn(f"\n{tui.style(tui.DIM)}Authenticated providers:{tui.style(tui.RESET)}")
     for name in sorted(authenticated_providers):
         color = tui.provider_color(name)
-        print_fn(f"  {color}{name}{tui.RESET}: known models (reference only) = {known_models_for(name)}")
+        print_fn(f"  {color}{name}{tui.style(tui.RESET)}: known models (reference only) = {known_models_for(name)}")
 
-    print_fn(f"\n{tui.DIM}Routable tiers:{tui.RESET}")
+    print_fn(f"\n{tui.style(tui.DIM)}Routable tiers:{tui.style(tui.RESET)}")
     for tier, (provider, model) in routable.items():
         color = tui.provider_color(provider)
-        print_fn(f"  {tier}: {color}{provider}/{model}{tui.RESET}")
+        print_fn(f"  {tier}: {color}{provider}/{model}{tui.style(tui.RESET)}")
 
     for tier, (provider, model) in unroutable.items():
         print_fn(
-            f"{tui.ERROR_COLOR}[warning]{tui.RESET} tier '{tier}' maps to '{provider}/{model}' but you're not "
+            f"{tui.style(tui.ERROR_COLOR)}[warning]{tui.style(tui.RESET)} tier '{tier}' maps to '{provider}/{model}' but you're not "
             f"authenticated with {provider} - messages classified into this tier "
             f"will fail with an auth error until you log in."
         )
