@@ -501,6 +501,26 @@ rather than letting every message fail individually.
 is pinned against the real `TIER_MODELS` so it starts failing (in the good
 way) the day a Codex tier gets calibrated in.
 
+**Restyle pass (2026-07-30).** `tui.py` gained `ansi_enabled()` (`NO_COLOR`
+env var + `sys.stdout.isatty()`) and a `style(code)` wrapper every
+color/bold/dim-emitting helper routes through — piping `llm-chat` to a file
+no longer fills it with escape-code bytes, but bullets/glyphs/spacing always
+render regardless, so a logged transcript stays structurally readable.
+Recolored the tool-call bullet from amber to green and switched the
+thinking glyph from `✻` to a literal `*` (still `DIM`, not a hardcoded gray
+color — theme-safe across light/dark terminals). `StreamRenderer` now emits
+a white bullet before Claude's own streamed text (previously unprefixed),
+separates every segment (thinking→tool, tool→tool, tool→text, text→tool)
+with a blank line instead of the old asymmetric one-sided spacing, and
+gained a `start()` method that shows a "connecting…" status — cleared by
+the same `\r\x1b[2K` trick as `thinking_status()` — for the dead air between
+`on_decision` firing and the first real stream event (auth check/subprocess
+startup/time-to-first-byte). `chat_loop()` prints a `tui.divider()` (sized
+via `shutil.get_terminal_size`, 80-column fallback, rule only — never for
+text wrapping) plus a blank line before every `you>` prompt after the
+first, and a blank line after the user's line before the header, for
+messages that actually route.
+
 ## Auth pre-flight check
 
 Both provider adapters export `check_auth() -> tuple[bool, str]` that
