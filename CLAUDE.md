@@ -5,29 +5,25 @@ that clears a quality floor for that task category, then actually run it.
 The live-routing counterpart to `llm-eval-harness`, which benchmarks
 prompt/model quality offline to calibrate the tiers this router picks from.
 
-## Next step (updated 2026-07-28)
+## Next step (updated 2026-07-30)
 
-Shadow evaluation landed, then `audit_tier2.py`/`report_shadow_divergence.py`
-got packaged as real console scripts (`llm-route-audit-tier2`,
-`llm-route-shadow-report`) with a documented cron/launchd recipe — see
-"Scheduling audits". Nothing is actually scheduled on any machine yet as
-part of that change; it's a documented, portable recipe for whoever installs
-this. Candidates for what comes next, ranked:
+`audit_tier2`/`shadow_report` launchd jobs are live on this dev machine
+(`~/Library/LaunchAgents/com.llm-task-router.*.plist`, daily 06:00/06:15,
+`DATABASE_URL=postgresql:///llm_task_router`, logs in
+`~/Library/Logs/llm-task-router/`) — verified with one manual
+`launchctl start` each before trusting the schedule. `routing_decisions`
+will accumulate real shadow-comparison data day over day; periodically
+re-run `llm-route-shadow-report` (or read `shadow_report.log`) once more
+than the current 1 real shadow-scored row exists, to judge tier 1 vs. tier 2
+divergence (see "The classifier"). This machine instance doesn't change the
+portable recipe in "Scheduling audits" below.
 
-1. **Actually wire the cron/launchd job on a real machine** and let
-   `routing_decisions` accumulate real shadow-comparison data — the whole
-   point of shadow eval was gathering "the data needed before tier 1's
-   heuristic grid can ever be deprecated" (see "The classifier"), and right
-   now there's only 1 real shadow-scored row logged locally (confirmed via
-   `llm-route-shadow-report`) — nowhere near enough to draw a conclusion.
-2. **Codex tier calibration** (separate, unrelated thread) — re-probe
-   reachable Codex models and run `llm-eval-harness`'s `calibrate-tier` skill
-   to see if any now clears haiku's quality floor, unblocking a second
-   provider in `tiers.TIER_MODELS`. Deferred once already in favor of the
-   cron work above (2026-07-28 conversation).
-3. Lower priority, explicitly parked in "Known rough edges" below: plan-mode
-   for `llm-chat`, Windows `select()` support, cross-provider session
-   continuity.
+Two threads stay explicitly on hold in favor of letting that schedule
+accumulate data first (deferred twice, most recently 2026-07-29): **Codex
+tier calibration** (re-probe reachable Codex models, re-run
+`llm-eval-harness`'s `calibrate-tier` skill) and **`llm-chat` plan mode**
+(see "Known rough edges"). Also parked: Windows `select()` support,
+cross-provider session continuity.
 
 Don't re-derive this by re-reading the whole file — start here, then jump to
 the referenced section only if you need the full backstory.
@@ -35,25 +31,22 @@ the referenced section only if you need the full backstory.
 ## Why it's built this way
 
 - **Subscription CLIs, not API keys.** Every provider call shells out to a
-  headless CLI (`claude -p`, `codex exec`) instead of an API/SDK, same
-  cost-avoidance rationale as `llm-eval-harness`'s `claude_cli.py`: no
-  separate per-token billing, runs on existing subscriptions.
+  headless CLI (`claude -p`, `codex exec`) instead of an API/SDK — same
+  cost-avoidance rationale as `llm-eval-harness`: no per-token billing, runs
+  on existing subscriptions.
 - **Zero third-party dependencies for the CLI/provider-adapter layer** —
   stdlib only (`dataclasses`, `argparse`, `subprocess`, `json`), matching
-  `llm-eval-harness`. **No longer true repo-wide**, as of the tier-2
-  continuous-learning classifier (2026-07-27, see "Tier 2" below):
-  `sentence-transformers` and `psycopg`/`pgvector` are real, permanent
-  runtime dependencies of `tier2_classifier.py`/`vector_store.py`/
-  `decision_log.py`. Deliberate, discussed choice — building the actual
-  long-term product was judged more valuable than staying dependency-free.
-  The rule still holds everywhere else; don't read this as license to add
-  dependencies elsewhere without the same deliberate discussion.
-- **Independent from `llm-eval-harness`.** This repo has its own dataclasses
-  and provider adapters rather than importing the eval harness as a package.
-  The two projects interact conceptually (the harness's benchmark runs
-  calibrate the tier map in `tiers.py`), not through shared code — a
-  live-routing runtime and an offline benchmark runner are different enough
-  consumption patterns that coupling them would be the wrong kind of DRY.
+  `llm-eval-harness`. **No longer true repo-wide**: `sentence-transformers`
+  and `psycopg`/`pgvector` are real, permanent runtime dependencies of the
+  tier-2 classifier (`tier2_classifier.py`/`vector_store.py`/
+  `decision_log.py`) — a deliberate, discussed exception. The rule still
+  holds everywhere else.
+- **Independent from `llm-eval-harness`.** Own dataclasses and provider
+  adapters rather than importing the eval harness as a package — the two
+  interact conceptually (the harness's benchmark runs calibrate `tiers.py`),
+  not through shared code, since a live-routing runtime and an offline
+  benchmark runner are different enough consumption patterns that coupling
+  them would be the wrong kind of DRY.
 
 ## Architecture
 
@@ -100,46 +93,45 @@ llm_task_router/
 ## The classifier: tier-1 heuristic + tier-2 continuous-learning cascade
 
 Originally scoped as three tiers (heuristic → a trained model cold-started
-from `llm-eval-harness` golden labels → cheap-LLM fallback). Design review on
-2026-07-27 collapsed the last two into one mechanism instead of building the
-intermediate static model — see "Tier 2" below. `classifier.py`'s heuristic
-grid remains tier 1, unchanged, the free/zero-latency first pass; expected to
-be deprecated later (not yet) once tier 2 earns enough coverage to be trusted
-alone.
+from `llm-eval-harness` golden labels → cheap-LLM fallback). A 2026-07-27
+design review collapsed the last two into one mechanism instead of building
+the intermediate static model — see "Tier 2" below. `classifier.py`'s
+heuristic grid remains tier 1, unchanged, the free/zero-latency first pass;
+expected to be deprecated later (not yet) once tier 2 earns enough coverage
+to be trusted alone.
 
 **Escalation to flagship is precision-first, not recall-first** (reversed
 2026-07-27 from an original "escalate under uncertainty" default).
 `router.route()` requires both a grid cell mapped to `H` and — unless the
-caller explicitly provided `task_type` (trusted as a deliberate override) — a
-genuine high-stakes signal in the description itself
-(`classifier.has_high_stakes_signal()`; see `IMPACT_KEYWORDS`'s docstring for
-the deliberately narrow production/security/compliance/irreversibility/scale
-vocabulary). A shape-only match (`architecture`'s `TYPE_KEYWORDS` includes
-bare "design"/"strategy", which fire on a trivial UI question as readily as a
-real one) no longer earns flagship alone. An inferred `H` without keyword
-corroboration falls through to tier 2's `resolve_high_stakes()` (below)
-rather than capping unconditionally at `mid` — a real escalation path for
-genuinely hard tasks that don't use recognized vocabulary (e.g. "migrate the
-k8s cluster to a new region"), confirmed against a real run.
+caller explicitly provided `task_type` (a trusted override) — a genuine
+high-stakes signal in the description itself
+(`classifier.has_high_stakes_signal()`, matching a deliberately narrow
+production/security/compliance/irreversibility/scale vocabulary). A
+shape-only match (bare "design"/"strategy" firing on a trivial UI question
+as readily as a real one) no longer earns flagship alone. An inferred `H`
+without keyword corroboration falls through to tier 2's
+`resolve_high_stakes()` rather than capping unconditionally at `mid` — a
+real escalation path for hard tasks that don't use recognized vocabulary
+(e.g. "migrate the k8s cluster to a new region"), confirmed against a real
+run.
 
 **No-signal fallback**: a fully-unresolved description used to inherit
 `classify_description()`'s `task_type="architecture"` safety placeholder and
-silently escalate via architecture's uniform-`H` row (a real incident: "reply
-with exactly the word: pong" routed to opus, ~$0.18 to repeat one word). Both
-axes fully unresolved now hedges to `mid` instead of consulting the grid
-(`tests/test_router.py::test_route_hedges_to_mid_when_no_keyword_signal_and_tier3_is_unavailable`
-pins the fallback-unavailable case).
+silently escalate via architecture's uniform-`H` row — a real incident:
+"reply with exactly the word: pong" routed to opus, ~$0.18 to repeat one
+word. Both axes fully unresolved now hedges to `mid` instead of consulting
+the grid (pinned by
+`tests/test_router.py::test_route_hedges_to_mid_when_no_keyword_signal_and_tier3_is_unavailable`).
 
 **Tier 3 (`_classify_via_llm()`)** handles that no-signal band: one stripped
-haiku call judges the description's actual difficulty/consequence/ambiguity
-directly, rather than a keyword list (tried, rejected — doesn't generalize)
-or embeddings (rejected at the time on `llm-eval-harness`'s prior finding
-that they don't cleanly separate this kind of soft-semantic distinction at
-small scale — tier 2 below revisited that finding for a different question
-with a different result). Reuses `claude_cli.invoke(disable_tools=True,
-system_prompt=...)`, landing in `eval_harness`'s ~$0.003-0.005/call bracket
-instead of `llm-chat`'s ~$0.07-0.30/call. Returns `None` on any failure
-(provider error, unparseable text, exception); `route()` falls back to the
+haiku call judges difficulty/consequence/ambiguity directly, rather than a
+keyword list (tried, rejected — doesn't generalize) or embeddings (rejected
+at the time on `llm-eval-harness`'s prior finding that they don't cleanly
+separate this kind of distinction at small scale — tier 2 below revisited
+that finding for a different question with a different result). Reuses
+`claude_cli.invoke(disable_tools=True, system_prompt=...)`, landing in
+`eval_harness`'s ~$0.003-0.005/call bracket instead of `llm-chat`'s
+~$0.07-0.30/call. Returns `None` on any failure; `route()` falls back to the
 `mid` hedge.
 
 ## Tier 2: the continuous-learning classifier
@@ -153,30 +145,29 @@ resolution and high-stakes corroboration — not two separate mechanisms.
 
 **Modules**: `embeddings.py` (`embed(text) -> list[float]`, lazy-singleton
 `sentence-transformers all-MiniLM-L6-v2`, 384-dim) · `vector_store.py`
-(Postgres/pgvector client, `DATABASE_URL`-configured — see "Architecture"
-above) · `tier2_classifier.py` (`resolve_task_type()` / `resolve_high_stakes()`,
-the orchestration `router.py` calls). `scripts/seed_vector_store.py`
-cold-started the store from `llm-eval-harness`'s 98 golden cases (task_type
-only — no `is_high_stakes` ground truth exists in that data, so that column
-starts empty and fills in only as real `needs_corroboration` requests resolve
+(Postgres/pgvector client, `DATABASE_URL`-configured) · `tier2_classifier.py`
+(`resolve_task_type()` / `resolve_high_stakes()`, the orchestration
+`router.py` calls). `scripts/seed_vector_store.py` cold-started the store
+from `llm-eval-harness`'s 98 golden cases (task_type only — no
+`is_high_stakes` ground truth exists in that data, so that column starts
+empty and fills in only as real `needs_corroboration` requests resolve
 through tier 2 over time).
 
 **Write-back is LLM-fallback-only, never on an NN-confident hit** — a
 matching neighbor already covers that region of the embedding space;
 re-inserting it would add a near-duplicate with no new information. This is
-what makes it "continuous learning" rather than a one-time cold start: the
-same question never needs a second LLM call.
+what makes it "continuous learning" rather than a one-time cold start.
 
 **`AGREEMENT_THRESHOLD = 0.8` (≥4/5 of `NEIGHBOR_K=5` nearest neighbors must
-share a label) came from a real leave-one-out check against the seeded store,
-not a guess, and overturned the original design en route:**
+share a label) came from a real leave-one-out check against the seeded
+store, not a guess, and overturned the original design en route:**
 1. Raw cosine similarity does **not** cleanly separate same-label from
-   different-label neighbors at this data/model scale (same-label median
-   ~0.32, cross-label median ~0.29 — heavily overlapping). A hard similarity
-   floor (the first draft) would have rejected most true matches — the same
-   shape of finding `llm-eval-harness`'s CLAUDE.md already documents for a
-   structurally similar problem, confirmed independently a second time.
-2. Relative *agreement* among the k neighbors does carry real signal despite
+   different-label neighbors at this scale (same-label median ~0.32,
+   cross-label median ~0.29 — heavily overlapping). A hard similarity floor
+   (the first draft) would have rejected most true matches — the same shape
+   of finding `llm-eval-harness`'s CLAUDE.md documents for a structurally
+   similar problem.
+2. Relative *agreement* among the k neighbors carries real signal despite
    (1): 72.4% accuracy unconditionally (98 samples, 7 classes, chance ~14%),
    rising monotonically — 78.2% at ≥3/5 (80% coverage), 87.1% at ≥4/5 (32%
    coverage), 100% at 5/5 (8% coverage, too rare alone). Fewer than
@@ -186,28 +177,24 @@ not a guess, and overturned the original design en route:**
 **`needs_corroboration` no longer caps to `mid` unconditionally on a
 keyword-negative miss** — it falls through to `resolve_high_stakes()`
 (reusing the embedding already computed for task_type when there is one).
-`True` escalates to flagship for real; `False` or `None` (tier 2 unavailable)
-both still cap to `mid` — tier 2 only ever adds a path to a *correct*
-escalation, never removes the safety cap. Both `resolve_task_type()`/
-`resolve_high_stakes()` return `None` on any failure (provider error,
-unparseable text, exception) — `router.py` treats tier-2-unavailable as "fall
-back to heuristic-only," never a crash.
+`True` escalates to flagship for real; `False` or `None` (tier 2
+unavailable) both still cap to `mid` — tier 2 only ever adds a path to a
+*correct* escalation, never removes the safety cap. Both resolver functions
+return `None` on any failure — `router.py` treats tier-2-unavailable as
+"fall back to heuristic-only," never a crash.
 
-**`resolve_high_stakes()` gained a `source` field, 2026-07-28** —
-`HighStakesResolution(is_high_stakes, source)`, symmetric with
-`resolve_task_type()`'s `Tier2Resolution(task_type, source)`. Needed by drift
-auditing (below): without it, a live decision log couldn't tell whether a
-resolution came from the NN vote or the LLM fallback.
+**`resolve_high_stakes()` gained a `source` field, 2026-07-28**, symmetric
+with `resolve_task_type()`'s `Tier2Resolution(task_type, source)` — needed
+by drift auditing (below) to tell whether a resolution came from the NN vote
+or the LLM fallback.
 
 ## Drift auditing: logging every routing decision
 
-Built 2026-07-28, closing this file's former "no shadow evaluation, no live
-dual-routing, no drift auditing" rough edge. Distinct from
-`llm-eval-harness`'s `calibrate-tier` skill, which is offline calibration
-against a fixed 98-case golden set and never touches live traffic — before
-this work, `route()` discarded every decision the instant it was made, so
-there was no logged traffic to re-validate `AGREEMENT_THRESHOLD` against or
-catch a bad `llm_fallback` write-back with.
+Built 2026-07-28. Distinct from `llm-eval-harness`'s `calibrate-tier` skill
+(offline calibration against a fixed 98-case golden set, never touches live
+traffic) — before this, `route()` discarded every decision the instant it
+was made, so there was no logged traffic to re-validate `AGREEMENT_THRESHOLD`
+against or catch a bad `llm_fallback` write-back with.
 
 **`decision_log.py`** (second SQL module, alongside `vector_store.py`) writes
 one row per `route()` call to `routing_decisions`: resolved task_type/domain
@@ -216,30 +203,27 @@ and which mechanism produced each (`provided`/`inferred`/`tier2_nn`/
 `tier2_llm_fallback`/`unavailable` for high-stakes), plus the final
 bias/tier/model/reason. `embedding` is null when the heuristic resolved
 everything without ever calling `embeddings.embed()`. Wrapped in
-`try/except Exception: pass` in `route()` — a logging failure degrades to "no
-audit trail for this call," never a broken route. `tests/conftest.py`
+`try/except Exception: pass` in `route()` — a logging failure degrades to
+"no audit trail for this call," never a broken route. `tests/conftest.py`
 autouse-patches `log_decision` to a no-op for the whole suite; a handful of
 `test_router.py` tests override it explicitly to assert logged fields on
 representative paths.
 
-**`audit_tier2.py`** re-runs the same leave-one-out methodology
-against the *live* `routing_examples` table (via
-`vector_store.all_labeled_examples()`) instead of the frozen seed, printing
-the same kind of agreement curve plus a "threshold holds / consider raising"
+**`audit_tier2.py`** re-runs the same leave-one-out methodology against the
+*live* `routing_examples` table instead of the frozen seed, printing the
+same kind of agreement curve plus a "threshold holds / consider raising"
 verdict, and flags `source='llm_fallback'` rows whose neighbors now
-confidently disagree with the stored label — printed for manual review only,
-never auto-corrected. An opt-in `--judge-flagged` pass gets one cheap second
-LLM opinion per flagged row (same call shape as tier 2's own fallback).
-Verified against the real local store: 101 `task_type` rows produced a live
-curve (73.3%/79.0%/88.2%/100.0%) tracking the original seed-only numbers,
-verdict "holds," 0 suspect rows; `is_high_stakes` (3 rows) correctly reported
-"not enough rows yet." Originally manual/periodic like `seed_vector_store.py`
-— now packaged as an installable console script and cron/launchd-schedulable,
-see "Scheduling audits" below.
+confidently disagree with the stored label — manual review only, never
+auto-corrected. An opt-in `--judge-flagged` pass gets one cheap second LLM
+opinion per flagged row. Verified against the real local store: 101
+`task_type` rows produced a live curve (73.3%/79.0%/88.2%/100.0%) tracking
+the seed-only numbers, verdict "holds," 0 suspect rows; `is_high_stakes` (3
+rows) correctly reported "not enough rows yet." Now an installable console
+script, cron/launchd-schedulable — see "Scheduling audits" below.
 
 **Gotcha worth restating**: `vector_store.all_labeled_examples()`'s first
-draft called `list(row[2])` on the embedding column, assuming an iterable — a
-`register_vector()`-registered connection actually returns a
+draft called `list(row[2])` on the embedding column, assuming an iterable —
+a `register_vector()`-registered connection actually returns a
 `pgvector.Vector` object there, not iterable; failed with a real `TypeError`
 against the real store. Fixed with `Vector.to_list()`. Any future module
 reading embeddings back out of Postgres should expect the same and verify
@@ -247,84 +231,74 @@ against a real query first.
 
 ## Shadow evaluation: live dual-routing without doubling cost
 
-Built 2026-07-28, closing this file's last documented rough edge ("no live
-dual-routing — a request never goes to two tiers to compare"). Distinct from
-both drift auditing above (which re-validates tier 2's *own* NN/LLM
-resolutions against themselves) and `llm-eval-harness`'s offline calibration
-(a fixed 98-case golden set) — this compares tier 1 against tier 2 on live
-traffic, which is the actual open question blocking tier 1's eventual
-deprecation (see "The classifier" above).
+Built 2026-07-28. Distinct from both drift auditing above (re-validates
+tier 2's *own* NN/LLM resolutions against themselves) and
+`llm-eval-harness`'s offline calibration (a fixed golden set) — this
+compares tier 1 against tier 2 on live traffic, the actual open question
+blocking tier 1's eventual deprecation (see "The classifier").
 
-**Not a real second model invocation.** The obvious shape of "shadow
-evaluation" — actually calling a second model on every request and comparing
-outputs — would double real per-call cost for every single routed request,
-which contradicts this repo's cost discipline everywhere else (`_classify_via_llm`,
-`tier2_classifier`'s LLM fallback, all explicitly reasoned about
-dollars-per-call). Instead, `router._shadow_tier1_only_decision()` computes a
-second **routing decision**, not a second response: what tier the request
-would have gotten if tier 2 had never been consulted at all, using only data
-already computed for the real decision (`classification`, the grid, keyword
-high-stakes matching) — zero extra embedding calls, zero extra LLM calls,
-zero extra Postgres round-trips.
+**Not a real second model invocation.** Actually calling a second model on
+every request to compare outputs would double real per-call cost, which
+contradicts this repo's cost discipline everywhere else. Instead,
+`router._shadow_tier1_only_decision()` computes a second **routing
+decision**, not a second response: what tier the request would have gotten
+if tier 2 had never been consulted, using only data already computed for the
+real decision (`classification`, the grid, keyword high-stakes matching) —
+zero extra embedding calls, zero extra LLM calls, zero extra Postgres round
+trips.
 
 **The no-signal case is a deliberate approximation, not a full replay.** The
-real no-signal branch (`_classify_via_llm`, tier 3) makes a genuine LLM call;
-re-invoking it a second time just to populate a shadow column would
-reintroduce the exact double-cost problem this design avoids. The shadow
-reading always hedges the no-signal case straight to `mid` instead — the same
-static fallback tier 3 itself uses on its own failure, so this is a
-defensible stand-in for "would have escalated," not a fabricated number.
+real no-signal branch (tier 3) makes a genuine LLM call; re-invoking it a
+second time just to populate a shadow column would reintroduce the same
+double-cost problem. The shadow reading always hedges the no-signal case
+straight to `mid` instead — the same static fallback tier 3 itself uses on
+its own failure, a defensible stand-in for "would have escalated," not a
+fabricated number.
 
 **`route()` logs both, acts on only one.** Every call computes
 `shadow_bias`/`shadow_tier`/`shadow_reason` alongside the real decision and
 passes both to `decision_log.log_decision()` — the shadow fields never touch
 `provider`/`model`/the returned `RouteDecision`, purely an audit-row column.
 `decision_log.py` gained `fetch_decisions()` (a `LoggedDecision` NamedTuple
-per row) to read the table back in batch, the same one-round-trip-then-
-analyze-in-Python shape `vector_store.all_labeled_examples()` already
-established.
+per row) to read the table back in batch, the same shape
+`vector_store.all_labeled_examples()` already established.
 
 **`report_shadow_divergence.py`** reads the live table and reports:
 divergence rate (real tier vs. shadow tier), direction (`tiers.TIER_ORDER`
-now exists specifically for this — escalated = tier 2 routed more expensively
+exists specifically for this — escalated = tier 2 routed more expensively
 than tier 1 alone would have; de-escalated = the reverse, e.g. tier 2
-correctly resolving a task_type the heuristic couldn't place, avoiding an
-unnecessary `mid` hedge), and which `tier2_classifier` axis (task_type
-resolution vs. high-stakes corroboration) drove each divergence. Deliberately
-does not judge which side was *right* — that needs a ground-truth label or a
-judge call this script doesn't make; it only measures how often and in which
-direction the two disagree, the input needed for an eventual tier-1
-deprecation call.
+correctly resolving a task_type the heuristic couldn't place), and which
+`tier2_classifier` axis drove each divergence. Deliberately does not judge
+which side was *right* — that needs a ground-truth label or a judge call
+this script doesn't make; it only measures how often and in which direction
+the two disagree, the input needed for an eventual tier-1 deprecation call.
 
 **Migration note**: `db/schema.sql`'s `CREATE TABLE routing_decisions` now
 includes `shadow_bias`/`shadow_tier`/`shadow_reason` (nullable, for
 migration compatibility with rows logged before this existed). An existing
 live database needs the three commented `ALTER TABLE` statements at the
 bottom of that file run manually via `psql` — not applied automatically,
-same one-time/not-idempotent discipline the rest of that file already
-documents.
+same one-time/not-idempotent discipline the rest of that file documents.
 
 ## Scheduling audits
 
 Built 2026-07-28. `audit_tier2.py` and `report_shadow_divergence.py`
 originally lived under `scripts/` as loose dev-only files — confirmed via
 `uv build --wheel` that `scripts/` never shipped in the built wheel, so
-anyone installing this as a published package (not working from a git
-checkout) had no way to run either one. Both moved into the `llm_task_router`
-package proper and got real `[project.scripts]` entries in `pyproject.toml`:
-`llm-route-audit-tier2` and `llm-route-shadow-report`, alongside the existing
-`llm-route`/`llm-chat` pattern. `scripts/seed_vector_store.py` deliberately
-stayed put — a one-time cold-start operation, not something meant to run on
-a schedule.
+anyone installing this as a published package had no way to run either one.
+Both moved into the `llm_task_router` package proper with real
+`[project.scripts]` entries: `llm-route-audit-tier2` and
+`llm-route-shadow-report`, alongside the existing `llm-route`/`llm-chat`
+pattern. `scripts/seed_vector_store.py` deliberately stayed put — a one-time
+cold-start operation, not something meant to run on a schedule.
 
-Neither script writes anything or auto-corrects anything (see "Drift
-auditing"/"Shadow evaluation" above) — they only print a report a human
-reads. Neither has an explicit exit-code contract either: a genuine failure
-(unset `DATABASE_URL`, DB connection error) surfaces as an uncaught exception
-and a nonzero exit already, for free; a "consider raising" verdict or a high
-divergence rate still exits 0, since that's a judgment call for the human
-reading the log, not a failure condition — a scheduler should alert on
-"job crashed," never on "job ran and found something worth reading."
+Neither script writes anything or auto-corrects anything — they only print a
+report a human reads. Neither has an explicit exit-code contract: a genuine
+failure (unset `DATABASE_URL`, DB connection error) surfaces as an uncaught
+exception and a nonzero exit already, for free; a "consider raising" verdict
+or a high divergence rate still exits 0, since that's a judgment call for
+the human reading the log — a scheduler should alert on "job crashed," never
+on "job ran and found something worth reading."
 
 Example recipes for all three major platforms (generic — adapt paths/venv
 for your own install, not tied to any one machine):
@@ -379,11 +353,13 @@ set DATABASE_URL=postgresql:///llm_task_router
 ```
 
 Daily was chosen over weekly, on all three platforms, to track
-drift/divergence trends while `routing_decisions` is still accumulating
-from day-to-day `llm-chat`/`llm-route` usage. None of these three recipes
-is wired up on any specific machine as part of this change — the point is
-a portable pattern any installer of this library can adopt on whichever OS
-they're on, not a personal cron/launchd/Task Scheduler job for one dev box.
+drift/divergence trends while `routing_decisions` is still accumulating.
+None of these three recipes is tied to any one machine — the point is a
+portable pattern any installer can adopt on whichever OS they're on. The
+launchd variant has since been instantiated on this dev machine — see
+"Next step" above for the real paths/schedule used; that instantiation
+lives outside the repo (`~/Library/LaunchAgents/`), so this section stays
+generic/unmodified.
 
 ## Adding a provider
 
@@ -431,34 +407,30 @@ off existing Claude/ChatGPT subscriptions; no code path touches
 **Session continuity (2026-07-26).** `TaskRequest.session_id` is generated
 once per `chat_loop()` run (not per message) and threaded through
 `route_and_run() -> provider.invoke(..., session_id=...)` unconditionally.
-Every message in a session shares one `session_id`, so history continues even
-as different messages route to different Claude tiers/models — lets
+Every message in a session shares one `session_id`, so history continues
+even as different messages route to different Claude tiers/models — lets
 `llm-chat` stay a thin router in front of real Claude Code functionality
 (tools, system prompt, CLAUDE.md/hooks) instead of reimplementing an
 interface that mimics it. (Rejected first: a bespoke reimplemented chat
 interface, and a raw PTY takeover injecting `/model` mid-session —
 undocumented, more fragile.)
 
-Confirmed against real `claude` 2.1.220 output (2026-07-26, not guessed — see
-verification commands in `providers/claude_cli.py`'s docstring): the *first*
+Confirmed against real `claude` 2.1.220 output (2026-07-26): the *first*
 call per session uses `--session-id "$SID"`; every call after must use
 `--resume "$SID"` instead — reusing `--session-id` on a second call fails
-outright ("Session ID ... is already in use"), but `--resume` correctly
-continues history across a `--model` change. `claude_cli.py` tracks which
-session ids have had their establishing call in a module-level
-`_established_sessions` set so callers just pass the same `session_id` every
-time without knowing which flag applies.
+outright, but `--resume` correctly continues history across a `--model`
+change. `claude_cli.py` tracks which session ids have had their establishing
+call in a module-level `_established_sessions` set so callers just pass the
+same `session_id` every time without knowing which flag applies.
 
 **Full functionality, not cost-minimized** — a deliberate choice distinct
 from `llm-eval-harness`'s adapter. `providers/claude_cli.py` doesn't strip
 the system prompt or disable tools/MCP: real tools, system prompt,
 CLAUDE.md/hooks all work, at real per-call cost (~$0.07-0.30/call vs.
 eval_harness's ~$0.003-0.005 stripped). Tool calls run under
-`--permission-mode bypassPermissions` since a headless call has no TTY for an
-approval prompt — confirmed executing real commands with zero approval
-prompts. Doesn't affect `llm-eval-harness`, which has its own separate
-`claude_cli.py`. Timeout is 300s (up from 60s) to accommodate real tool-use
-turns.
+`--permission-mode bypassPermissions` since a headless call has no TTY for
+an approval prompt — confirmed executing real commands with zero approval
+prompts. Timeout is 300s (up from 60s) to accommodate real tool-use turns.
 
 **Cross-provider mid-conversation continuity is still unsolved.**
 `codex_cli.invoke` accepts `session_id` for `Provider`-protocol conformance
@@ -471,60 +443,51 @@ state is local to it.
 **Streaming transport + ANSI styling (2026-07-27).** `claude_cli.py` switched
 from `--output-format json` to `--output-format stream-json
 --include-partial-messages --verbose` (`--verbose` is required — omitting it
-is a hard CLI error) — one JSON event per line as it arrives. `invoke()` now
-uses `subprocess.Popen`, with a `_drain()` helper reading `stdout`/`stderr`
-concurrently via `select.select()` (not a plain `for line in proc.stdout`
-loop, which would reintroduce the classic pipe deadlock
-`subprocess.run(capture_output=True)` avoided for free). The 300s timeout is
-now a wall-clock deadline checked every `_drain()` iteration. Unix-only —
+is a hard CLI error) — one JSON event per line as it arrives. `invoke()` uses
+`subprocess.Popen`, with a `_drain()` helper reading `stdout`/`stderr`
+concurrently via `select.select()` (avoids the classic pipe deadlock a plain
+`for line in proc.stdout` loop would reintroduce). The 300s timeout is now a
+wall-clock deadline checked every `_drain()` iteration. Unix-only —
 `select()` doesn't support pipes on Windows, unverified there. `invoke()`
-gained `on_event: Callable[[dict], None]`, called once per parsed event
-(`codex_cli.invoke()` accepts it for interface conformance but ignores it —
-still on `--output-last-message`). `route_and_run()` gained a matching
-`on_event` passthrough plus `on_decision: Callable[[RouteDecision], None]`,
-fired the instant `route()` resolves, before the provider call starts.
+gained `on_event: Callable[[dict], None]` (`codex_cli.invoke()` accepts it
+for interface conformance but ignores it). `route_and_run()` gained a
+matching `on_event` passthrough plus `on_decision: Callable[[RouteDecision],
+None]`, fired the instant `route()` resolves.
 
 `tui.py` is a stdlib-only ANSI styling module (escape codes, not
-`rich`/`textual`) rendering in the visual spirit of Claude Code's own CLI —
-not a pixel-exact clone, not a pty. `chat_loop()` wires a `tui.StreamRenderer`
-into `on_event` for live token-by-token streaming; `on_decision` prints the
-`[provider/model, tier=X]` header immediately. `chat_loop()`'s `write_fn`
-param (raw unterminated chunks, for streaming) is kept separate from
-`print_fn` (discrete lines, what tests assert on). `format_response()`
-remains the non-streaming full-message formatter (still the pinned test
-contract) but `chat_loop`'s success path no longer calls it, to avoid
-double-printing the streamed answer.
+`rich`/`textual`), rendering in the visual spirit of Claude Code's own CLI —
+not a pixel-exact clone, not a pty. `chat_loop()` wires a
+`tui.StreamRenderer` into `on_event` for live token-by-token streaming;
+`format_response()` remains the non-streaming formatter (still the pinned
+test contract) but the success path no longer calls it, to avoid
+double-printing.
 
 **Testing gotcha, worth restating:** switching `invoke()` from
 `subprocess.run` to `subprocess.Popen` silently invalidated every test that
-patched `subprocess.run` — they kept "passing" while actually falling through
-to a real, unmocked call (caught by a bash-level timeout after ~15-20 real
-calls had already gone out). Every `claude_cli.py` test now patches
-`subprocess.Popen` directly (`_FakeProcess`/`_FakeStream` in
-`tests/test_claude_cli.py`). Re-verify with the narrowest affected test (hard
-timeout) before trusting a green suite after any future change to this call
+patched `subprocess.run` — they kept "passing" while actually falling
+through to a real, unmocked call (caught by a bash-level timeout after
+~15-20 real calls had already gone out). Every `claude_cli.py` test now
+patches `subprocess.Popen` directly. Re-verify with the narrowest affected
+test before trusting a green suite after any future change to this call
 mechanism.
 
 **A static input-box frame was tried and reverted the same day.** `input()`
 hands line editing to the terminal's own readline layer, which
 overwrites/advances at the cursor — no way to keep a border in place once
-text wraps, since the frame was drawn before input started. Doing it properly
-needs raw terminal mode (`termios`/`tty`) with a hand-rolled line editor —
-declined twice as a much bigger build than everything else in this pass. Back
-to a plain `tui.prompt()`.
+text wraps. Doing it properly needs raw terminal mode (`termios`/`tty`) with
+a hand-rolled line editor — declined twice as a much bigger build than
+everything else in this pass. Back to a plain `tui.prompt()`.
 
 **Plan mode is explicitly deferred** — a future two-turn flow
 (`--permission-mode plan` to produce a plan, a follow-up `--resume` call to
 execute it), noted but not designed further until needed.
 
 **Login always defers to the provider's own interactive command.**
-`claude_cli.login()`/`codex_cli.login()` shell out with inherited stdio (no
-`capture_output`/`timeout`) to `claude auth login --claudeai`/`codex login`
-so the user completes the real OAuth/device flow in the same terminal —
-`repl.py` never parses that flow itself, and never trusts `login()`'s exit
-code as proof of success (`check_auth()` afterward is the real source of
-truth). `codex_cli.login()` has an unwired `device_auth: bool = False` param
-for a future headless/SSH login prompt.
+`claude_cli.login()`/`codex_cli.login()` shell out with inherited stdio to
+`claude auth login --claudeai`/`codex login` so the user completes the real
+OAuth/device flow in the same terminal — `repl.py` never parses that flow
+itself, and never trusts `login()`'s exit code as proof of success
+(`check_auth()` afterward is the real source of truth).
 
 **`known_models.py` is informational only** — never consulted by
 `route()`/`route_and_run()`. A hardcoded table of model slugs confirmed
@@ -532,9 +495,7 @@ reachable via this account's calibration history, used solely for `repl.py`'s
 startup summary. Same staleness risk as the Codex slug list it's drawn from.
 
 **Authenticating Codex alone makes zero tiers routable**, since
-`tiers.TIER_MODELS` maps every tier to `"claude"` (no Codex model has cleared
-a floor yet) — `repl.startup_auth_check()` can report Codex authenticated
-while `repl.routable_tiers()` returns empty, and `main()` refuses to start
+`tiers.TIER_MODELS` maps every tier to `"claude"` — `main()` refuses to start
 rather than letting every message fail individually.
 `tests/test_repl.py::test_routable_tiers_against_real_tier_models_with_only_codex_authenticated`
 is pinned against the real `TIER_MODELS` so it starts failing (in the good
@@ -547,29 +508,21 @@ Both provider adapters export `check_auth() -> tuple[bool, str]` that
 `codex login status` (text-matches "logged in"/"not logged in"). An
 unauthenticated call short-circuits to `ProviderResult(error="auth check
 failed: ...")` before reaching the real model subprocess, instead of falling
-through to whatever failure shape the underlying CLI produces on its own (a
-nonzero exit with a CLI-specific stderr message, or — `llm-eval-harness`'s
-worst observed case — every case coming back a misleadingly bad-looking
-`parse_error`).
+through to whatever failure shape the underlying CLI produces on its own.
 
 Both adapters' logged-out shapes are confirmed against real output
 (2026-07-26), without actually logging this dev account out:
 - **Claude**: `env -u ANTHROPIC_API_KEY claude --bare auth status` →
   `{"loggedIn": false, ...}` at exit 1. `--bare` skips keychain/OAuth reads
   entirely.
-- **Codex**: `CODEX_HOME=<empty dir> codex login status` → "Not logged in" at
-  exit 1.
+- **Codex**: `CODEX_HOME=<empty dir> codex login status` → "Not logged in"
+  at exit 1.
 
 Reuse these two techniques for testing this gate instead of a real logout,
-which needs an interactive re-auth flow to undo. Both `check_auth()`
-implementations were already written defensively (treat anything that
-doesn't clearly parse as "logged in" as unauthenticated) before this
-confirmation — the real output matched, so only docstrings/tests moved from
-"assumed" to "confirmed with a regression test pinned to the real string."
-
-A new provider's `check_auth()` should follow this same shape — don't skip it
-just because the provider's own nonzero-exit path eventually surfaces an auth
-error; the point is failing fast and consistently.
+which needs an interactive re-auth flow to undo. A new provider's
+`check_auth()` should follow this same shape — don't skip it just because
+the provider's own nonzero-exit path eventually surfaces an auth error; the
+point is failing fast and consistently.
 
 ## Known rough edges
 
@@ -577,10 +530,10 @@ error; the point is failing fast and consistently.
   install and a real authenticated call. Two things still open: (1) no
   dollar-cost field anywhere in `codex exec`'s output (stderr prints an
   unstructured token count, no per-model pricing to convert it), so
-  `cost_usd`/`duration_ms` stay 0.0/0 placeholders; (2) `--output-last-message`'s
-  behavior on a genuine content refusal (vs. a hard API error, which is
-  covered) is unconfirmed. Currently unreachable through the router anyway —
-  no tier routes to it yet.
+  `cost_usd`/`duration_ms` stay 0.0/0 placeholders; (2)
+  `--output-last-message`'s behavior on a genuine content refusal (vs. a
+  hard API error, which is covered) is unconfirmed. Currently unreachable
+  through the router anyway — no tier routes to it yet.
 - Codex has no flag equivalent to `--disallowed-tools "*"` — `--sandbox
   read-only` is the closest analog (can't write files) but can still run
   read-only shell commands. Don't assume cost/latency parity between the two
@@ -599,15 +552,10 @@ error; the point is failing fast and consistently.
   status section for the full table.
 - Tool access is resolved for every Claude call, not just `llm-chat`'s —
   `llm-route`'s one-shot path goes through the same `claude_cli.invoke()`,
-  sharing the same full-functionality/`bypassPermissions` behavior. Confirmed
-  deliberately with the user (2026-07-26): one adapter, one behavior, rather
-  than threading a cost-mode flag through both call paths.
-- ~~No shadow evaluation, no live dual-routing, no drift auditing~~ —
-  **closed 2026-07-28** for both halves (see "Drift auditing" and "Shadow
-  evaluation" above). ~~Both `audit_tier2.py` and `report_shadow_divergence.py`
-  are manual/periodic scripts, not... cron'd~~ — **closed 2026-07-28**, see
-  "Scheduling audits" above: both are now packaged console scripts with a
-  documented cron/launchd recipe. Still true: nothing auto-adjusts
-  `AGREEMENT_THRESHOLD` or deprecates tier 1 based on what they report — cron
-  only automates the *running*, not the judgment; a human still reads the
-  log and decides.
+  sharing the same full-functionality/`bypassPermissions` behavior.
+  Deliberate: one adapter, one behavior, rather than threading a cost-mode
+  flag through both call paths.
+- Nothing auto-adjusts `AGREEMENT_THRESHOLD` or deprecates tier 1 based on
+  what the drift/shadow reports find — scheduling only automates the
+  *running* of those reports, not the judgment; a human still reads the log
+  and decides.
