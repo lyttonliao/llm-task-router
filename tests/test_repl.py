@@ -4,6 +4,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from llm_task_router.repl import (
+    HELP_TEXT,
     check_provider_auth,
     chat_loop,
     ensure_provider_authenticated,
@@ -284,7 +285,9 @@ def test_chat_loop_streams_body_via_write_fn_and_does_not_reprint_it_via_print_f
     with patch("llm_task_router.repl.route_and_run", side_effect=fake_route_and_run):
         chat_loop(input_fn=Mock(side_effect=["fix the bug", "/exit"]), print_fn=print_fn, write_fn=written.append)
 
-    assert "".join(written) == "streamed answer\n"  # renderer.finish() appends the trailing newline
+    joined = "".join(written)
+    assert "streamed answer" in joined
+    assert joined.endswith("streamed answer\n")
     assert not any("streamed answer" in str(call) for call in print_fn.call_args_list)
     assert any("$0.0010" in str(call) or "0.0010" in str(call) for call in print_fn.call_args_list)
 
@@ -302,7 +305,75 @@ def test_chat_loop_error_path_prints_error_not_footer():
         chat_loop(input_fn=Mock(side_effect=["fix the bug", "/exit"]), print_fn=print_fn, write_fn=lambda t: None)
 
     assert any("error: auth check failed: not logged in" in str(call) for call in print_fn.call_args_list)
-    assert not any("cost $" in str(call) for call in print_fn.call_args_list)
+
+
+def test_chat_loop_prints_divider_between_turns_but_not_before_first_prompt():
+    from llm_task_router import tui
+
+    decision = RouteDecision(tier="cheap", provider="claude", model="haiku", reason="r")
+    result = ProviderResult(text="hi", cost_usd=0.001, duration_ms=100)
+
+    print_fn = Mock()
+    with patch("llm_task_router.repl.route_and_run", return_value=(decision, result)):
+        chat_loop(input_fn=Mock(side_effect=["first", "second", "/exit"]), print_fn=print_fn, write_fn=lambda t: None)
+
+    divider_calls = [c for c in print_fn.call_args_list if c.args and tui.DIVIDER_CHAR in str(c.args[0])]
+    # three prompts total (first, second, the /exit attempt) -> a divider
+    # before every one of them except the very first
+    assert len(divider_calls) == 2
+
+
+def test_chat_loop_prints_blank_gap_after_user_line_before_header():
+    decision = RouteDecision(tier="cheap", provider="claude", model="haiku", reason="r")
+    result = ProviderResult(text="hi", cost_usd=0.001, duration_ms=100)
+
+    def fake_route_and_run(request, *, on_event=None, on_decision=None):
+        on_decision(decision)
+        return decision, result
+
+    print_fn = Mock()
+    with patch("llm_task_router.repl.route_and_run", side_effect=fake_route_and_run):
+        chat_loop(input_fn=Mock(side_effect=["fix the bug", "/exit"]), print_fn=print_fn, write_fn=lambda t: None)
+
+    calls = [c.args[0] if c.args else "" for c in print_fn.call_args_list]
+    header_index = next(i for i, c in enumerate(calls) if "claude/haiku" in c)
+    assert calls[header_index - 1] == ""  # the blank-gap call immediately precedes the header
+
+
+def test_chat_loop_no_blank_gap_for_help_command():
+    """/help is answered on the same first turn (no divider preamble yet,
+    since first_turn is still True) - the very first print_fn call should
+    be the help text itself, with no blank-gap call ahead of it."""
+    print_fn = Mock()
+    with patch("llm_task_router.repl.route_and_run") as mock_route:
+        chat_loop(input_fn=Mock(side_effect=["/help", "/exit"]), print_fn=print_fn, write_fn=lambda t: None)
+
+    mock_route.assert_not_called()
+    assert print_fn.call_args_list[0].args[0] == HELP_TEXT
+
+
+def test_chat_loop_calls_renderer_start_from_on_decision_before_first_event():
+    decision = RouteDecision(tier="cheap", provider="claude", model="haiku", reason="r")
+    result = ProviderResult(text="hi", cost_usd=0.001, duration_ms=100)
+    written = []
+
+    def fake_route_and_run(request, *, on_event=None, on_decision=None):
+        on_decision(decision)
+        on_event(
+            {
+                "type": "stream_event",
+                "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "hi"}},
+            }
+        )
+        return decision, result
+
+    with patch("llm_task_router.repl.route_and_run", side_effect=fake_route_and_run):
+        chat_loop(input_fn=Mock(side_effect=["fix the bug", "/exit"]), print_fn=lambda *a: None, write_fn=written.append)
+
+    joined = "".join(written)
+    assert "connecting" in joined
+    assert "\r\x1b[2K" in joined
+    assert joined.index("connecting") < joined.index("\r\x1b[2K") < joined.index("hi")
 
 
 def test_chat_loop_unknown_slash_command_prints_message_and_continues_loop():

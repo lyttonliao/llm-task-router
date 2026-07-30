@@ -161,9 +161,21 @@ def chat_loop(*, input_fn=input, print_fn=print, write_fn=tui.default_write) -> 
     removed the same day: it can't wrap around input that line-wraps in the
     terminal without raw terminal mode and a hand-rolled line editor (the
     same bigger build declined for live-redraw streaming) - see tui.py's
-    module docstring for the full rationale. Plain styled prompt only."""
+    module docstring for the full rationale. Plain styled prompt only.
+
+    A divider + blank line print before every prompt after the first (so
+    turns don't run together) and a blank line prints after the user's line
+    for messages that actually route (before the header) - the visible gap
+    the user asked around each "you>" prompt. Skipped for blank input and
+    slash commands, which stay tight to the prompt they answer."""
     session_id = str(uuid.uuid4())
+    first_turn = True
     while True:
+        if not first_turn:
+            print_fn(tui.divider())
+            print_fn()
+        first_turn = False
+
         try:
             line = input_fn(tui.prompt())
         except EOFError:
@@ -183,13 +195,20 @@ def chat_loop(*, input_fn=input, print_fn=print, write_fn=tui.default_write) -> 
             print_fn(f"unknown command: {line} (try /help)")
             continue
 
+        print_fn()
+
         request = TaskRequest(description=line, session_id=session_id)
         renderer = tui.StreamRenderer(write_fn=write_fn)
+
+        def on_decision(d):
+            print_fn(tui.header(d))
+            renderer.start()
+
         try:
             decision, result = route_and_run(
                 request,
                 on_event=renderer.handle,
-                on_decision=lambda d: print_fn(tui.header(d)),
+                on_decision=on_decision,
             )
         except Exception as exc:
             # Deliberate broad catch, unlike every other layer of this repo:
