@@ -164,3 +164,51 @@ def test_header_strips_color_but_keeps_text_when_not_a_tty(monkeypatch):
     assert tui.CLAUDE_COLOR not in out
     assert tui.BOLD not in out
     assert "[claude/opus, tier=flagship]" in out
+
+
+def test_text_bullet_uses_bullet_and_text_color():
+    out = tui.text_bullet()
+
+    assert tui.BULLET in out
+    assert tui.TEXT_COLOR in out
+    assert tui.RESET in out
+
+
+def test_text_bullet_strips_color_but_keeps_bullet_when_no_color_set(monkeypatch):
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    out = tui.text_bullet()
+
+    assert tui.BULLET in out
+    assert tui.TEXT_COLOR not in out
+
+
+def test_connecting_status_says_connecting_and_is_dim():
+    out = tui.connecting_status()
+
+    assert "connecting" in out
+    assert tui.DIM in out
+
+
+def test_divider_sized_to_real_terminal_width(monkeypatch):
+    import os
+    import shutil
+
+    monkeypatch.setattr(shutil, "get_terminal_size", lambda fallback: os.terminal_size((40, 24)))
+
+    out = tui.divider()
+
+    assert out.count(tui.DIVIDER_CHAR) == 40
+
+
+def test_divider_falls_back_to_80_columns_when_size_unavailable(monkeypatch):
+    import os
+    import shutil
+
+    # shutil.get_terminal_size() itself falls back to `fallback` when the
+    # environment/os module can't determine a real size - simulate that.
+    monkeypatch.setattr(shutil, "get_terminal_size", lambda fallback: os.terminal_size(fallback))
+
+    out = tui.divider()
+
+    assert out.count(tui.DIVIDER_CHAR) == tui.DIVIDER_FALLBACK_WIDTH

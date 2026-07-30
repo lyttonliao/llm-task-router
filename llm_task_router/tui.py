@@ -24,6 +24,7 @@ terminal themes.
 """
 
 import os
+import shutil
 import sys
 from collections.abc import Callable
 
@@ -41,6 +42,8 @@ PROVIDER_COLORS = {"claude": CLAUDE_COLOR, "codex": CODEX_COLOR}
 
 BULLET = "⏺"
 THINKING_GLYPH = "*"
+DIVIDER_CHAR = "─"
+DIVIDER_FALLBACK_WIDTH = 80
 
 
 def ansi_enabled() -> bool:
@@ -92,6 +95,30 @@ def tool_line(name: str) -> str:
 
 def thinking_status() -> str:
     return f"{style(DIM)}{THINKING_GLYPH} thinking…{style(RESET)}"
+
+
+def connecting_status() -> str:
+    """Transient status for the dead-air window between the routing
+    decision being known and the first real stream event arriving (auth
+    check + subprocess startup + model time-to-first-byte) - cleared by the
+    same \\r\\x1b[2K overwrite StreamRenderer already uses for
+    thinking_status()."""
+    return f"{style(DIM)}connecting…{style(RESET)}"
+
+
+def text_bullet() -> str:
+    """Prefixes Claude's own streamed text/reasoning output - emitted once
+    per text content-block, not once per delta."""
+    return f"{style(TEXT_COLOR)}{BULLET}{style(RESET)} "
+
+
+def divider() -> str:
+    """Horizontal rule printed between chat turns. Uses the real terminal
+    width purely to size a rule line - NOT for text wrapping, which needs
+    raw terminal mode and was declined for the same reason the boxed-input-
+    frame idea was (see repl.py's chat_loop docstring)."""
+    width = shutil.get_terminal_size(fallback=(DIVIDER_FALLBACK_WIDTH, 24)).columns
+    return f"{style(DIM)}{DIVIDER_CHAR * width}{style(RESET)}"
 
 
 def default_write(text: str) -> None:
