@@ -217,38 +217,176 @@ content match what was actually decided at the time.
   models this account can reach clear the cheap tier's floor. See that
   repo's CLAUDE.md for the full comparison table.
 
-## Quick start
+## Setup
 
-Requirements:
+### 1. Prerequisites
 
 - Python 3.14+
-- [`uv`](https://docs.astral.sh/uv/) (recommended)
-- An authenticated `claude` CLI for routed runs
+- [`uv`](https://docs.astral.sh/uv/) (recommended — all commands below use it)
+- A local Postgres install with the [`pgvector`](https://github.com/pgvector/pgvector)
+  extension available (`CREATE EXTENSION vector` must succeed) — required
+  even if you only want tier-1 heuristic routing, since `router.py` imports
+  `vector_store`/`embeddings` unconditionally
+- An authenticated `claude` CLI (`claude auth login --claudeai`) for routed
+  runs and `llm-chat`; an authenticated `codex` CLI too if you plan to add a
+  Codex tier (see "Adding a provider" below) — no tier is calibrated to
+  Codex yet, so it isn't required for normal use
+- macOS/Linux for `llm-chat`'s live-streaming output (`repl.py`'s reader uses
+  `select.select()` on pipes, which doesn't work on Windows); the `route`
+  CLI itself is platform-independent
+
+### 2. Install dependencies
 
 ```bash
 uv sync --group dev
+```
 
-# Run the unit tests
+This pulls in `psycopg[binary]`, `pgvector`, and `sentence-transformers` —
+real runtime dependencies of the tier-2 classifier, not optional extras.
+
+### 3. Create the database and apply the schema
+
+```bash
+createdb llm_task_router
+psql llm_task_router -f llm_task_router/db/schema.sql
+```
+
+`schema.sql` is applied manually and is **not idempotent** — it's a one-time
+setup script (`CREATE TABLE` errors on a second run against a database that
+already has the tables). It creates the `vector` extension plus two tables:
+`routing_examples` (tier-2's labeled nearest-neighbor store) and
+`routing_decisions` (the drift-audit / shadow-eval log). If you're
+re-applying against an older database that predates shadow evaluation,
+run the three commented `ALTER TABLE ... ADD COLUMN shadow_*` statements at
+the bottom of that file instead of the `CREATE TABLE`.
+
+Export `DATABASE_URL` so the router can reach it (every command below
+assumes this is set in your shell):
+
+```bash
+export DATABASE_URL=postgresql:///llm_task_router
+```
+
+### 4. Seed the tier-2 vector store
+
+Tier 2 starts empty and needs the `llm-eval-harness` sibling repo checked
+out alongside this one (default path `../llm-eval-harness`) to cold-start
+from its 98 golden cases:
+
+```bash
+uv run python scripts/seed_vector_store.py
+# or, if llm-eval-harness lives somewhere else:
+uv run python scripts/seed_vector_store.py --cases-dir /path/to/llm-eval-harness/eval_harness/cases
+```
+
+This is a one-time operation — it only seeds `task_type` labels (no
+`is_high_stakes` ground truth exists in the golden set, so that column
+starts empty and fills in only from real traffic). Skipping this step
+doesn't break routing: with too few neighbors, tier 2 falls through to a
+cheap-LLM fallback (and still writes its own answer back), just without the
+cold-start coverage.
+
+### 5. Verify
+
+```bash
 uv run pytest -q
 
-# Inspect a routing decision without calling a model
 uv run python -m llm_task_router route \
+  "Design a fault-tolerant deployment strategy for our Kubernetes cluster" \
+  --dry-run
+```
+
+A working `--dry-run` call that prints a tier/provider/model/reason (rather
+than a `DATABASE_URL`/connection traceback) confirms both the DB and the
+package are wired up correctly.
+
+## Usage
+
+### Routing a single task
+
+```bash
+# Inspect a routing decision without calling a model
+uv run llm-route route \
   "Design a fault-tolerant deployment strategy for our Kubernetes cluster" \
   --dry-run
 
 # Route and execute a task with the currently calibrated provider/model tier
-uv run python -m llm_task_router route \
+uv run llm-route route \
   "Summarize these release notes for a frontend team" \
   --type summarization --domain frontend
 ```
 
-The current tier-1 router infers task type and domain from description
-keywords, then selects a low, medium, or high escalation bias. Supply
-`--type` and/or `--domain` to override either inference. Ambiguous task types
+(`uv run llm-route ...` is the installed console script; `uv run python -m
+llm_task_router route ...` is identical and still works.)
+
+The tier-1 heuristic infers task type and domain from description keywords,
+then selects a low/medium/high escalation bias; tier 2 (embeddings + the
+`routing_examples` nearest-neighbor store, falling through to a cheap LLM
+call) resolves whatever the heuristic can't confidently place. Supply
+`--type` and/or `--domain` to skip inference for either. Ambiguous task types
 fall back to the high-escalation architecture category rather than silently
 routing to a cheap model. `--dry-run` shows the resulting tier, provider,
-model, and rule without making a model call. Without it, the router invokes
-the calibrated Claude tier.
+model, and rule without making a model call; without it, the router invokes
+the calibrated Claude tier and prints the response, cost, and duration.
+
+### Interactive chat (`llm-chat`)
+
+```bash
+uv run llm-chat
+```
+
+Authenticates each configured provider once at startup (refuses to start if
+Codex is the only authenticated provider, since every tier currently maps to
+Claude — see `CLAUDE.md`), then routes every message you type independently
+through `route_and_run()`, streaming the response live. All messages in one
+session share a `session_id`, so Claude-side history/tools continue across
+turns even as different messages land on different tiers/models. Full tool
+use and your `CLAUDE.md`/hooks run for real (not a stripped eval-harness
+call) at real per-call cost (~$0.07-0.30/call), under
+`--permission-mode bypassPermissions` since there's no TTY for an approval
+prompt in a headless call.
+
+### Auditing tier 2 and shadow-eval divergence
+
+Two more installed console scripts, both read-only (they print a report,
+never write or auto-correct anything):
+
+```bash
+# Re-validates tier 2's AGREEMENT_THRESHOLD against the live routing_examples
+# table (leave-one-out check), and flags any llm_fallback-sourced row whose
+# neighbors now disagree with its stored label.
+uv run llm-route-audit-tier2
+uv run llm-route-audit-tier2 --label-column task_type
+uv run llm-route-audit-tier2 --judge-flagged   # one real LLM call per flagged row
+
+# Compares tier 2's real routing decisions against what tier 1 alone would
+# have chosen on the same live traffic (routing_decisions table).
+uv run llm-route-shadow-report
+```
+
+Both need `DATABASE_URL` set and enough logged/seeded rows to be meaningful
+(`audit_tier2` reports "not enough rows yet" per label column below
+`NEIGHBOR_K`; `shadow_report` reports "nothing to report" with zero
+shadow-scored rows). Neither has a special exit-code contract for a "bad"
+verdict — only a genuine crash (unset `DATABASE_URL`, connection failure)
+exits nonzero, since a "consider raising the threshold" or high-divergence
+reading is a judgment call for whoever reads the log, not something a
+scheduler should page on.
+
+### Scheduling the audits
+
+Both scripts are meant to run daily via cron/launchd/Task Scheduler so
+`routing_decisions` accumulates enough data to judge tier-1-vs-tier-2
+divergence over time. See `CLAUDE.md`, "Scheduling audits" for ready-to-adapt
+cron, launchd `.plist`, and Windows `schtasks` recipes.
+
+### Adding a provider
+
+See the `add-provider` skill (`.claude/skills/add-provider/SKILL.md`) for the
+full workflow. Don't add a new entry to `tiers.TIER_MODELS` or
+`classifier.TYPE_DOMAIN_GRID` without real calibration data from
+`llm-eval-harness`'s `calibrate-tier` skill first — see `CLAUDE.md`, "Adding
+a provider."
 
 ## Status
 
