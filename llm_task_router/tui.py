@@ -128,17 +128,18 @@ def default_write(text: str) -> None:
 
 class StreamRenderer:
     """Renders claude_cli's per-line NDJSON events live, in the spirit of
-    Claude Code's own CLI: a dim transient "thinking…" status while the
-    model reasons (cleared once real output starts, never dumping the raw
-    thinking text - that's collapsed in the real product too), one-line
-    colored bullets for tool calls as they start, and the final answer
-    streamed token-by-token as `text_delta` events arrive. write_fn receives
-    raw chunks with no added newlines, so tests can assert exactly what
-    would hit the terminal.
+    Claude Code's own CLI: a dim transient "connecting…"/"thinking…" status
+    while nothing has streamed yet (each cleared once real output starts,
+    never dumping the raw thinking text - that's collapsed in the real
+    product too), one-line colored bullets for tool calls and for Claude's
+    own text as each segment starts, blank-line spacing between segments,
+    and the final answer streamed token-by-token as `text_delta` events
+    arrive. write_fn receives raw chunks with no added newlines, so tests
+    can assert exactly what would hit the terminal.
 
-    Only two of claude_cli's event shapes are rendered (thinking/tool_use
-    content-block starts, text_delta content-block deltas) - the rest
-    (`system` init/status, `input_json_delta` partial tool args,
+    Only three of claude_cli's event shapes are rendered (thinking/text/
+    tool_use content-block starts, text_delta content-block deltas) - the
+    rest (`system` init/status, `input_json_delta` partial tool args,
     `signature_delta`, the final `result` line) are real but not useful to
     show in a simple chat client and are silently ignored here, not
     unhandled - `claude_cli.invoke()` already extracts the `result` event
@@ -147,8 +148,21 @@ class StreamRenderer:
 
     def __init__(self, write_fn: Callable[[str], None] = default_write):
         self._write = write_fn
-        self._thinking_shown = False
-        self._text_started = False
+        self._status_shown = False
+        self._text_ever_started = False
+        self._any_output = False
+        self._in_text_block = False
+
+    def start(self) -> None:
+        """Call once, right after the routing header prints and before the
+        (blocking) rest of route_and_run() runs - covers the dead-air
+        window from auth-check/subprocess-startup/time-to-first-byte.
+        Deliberately not done in __init__: constructing a renderer must have
+        no I/O side effect, since existing tests construct one and feed it
+        a single event, asserting exact output. Cleared by whichever real
+        event arrives first, same as thinking_status()."""
+        self._write(connecting_status())
+        self._status_shown = True
 
     def handle(self, event: dict) -> None:
         if event.get("type") != "stream_event":
@@ -162,26 +176,49 @@ class StreamRenderer:
 
     def _handle_block_start(self, block: dict) -> None:
         btype = block.get("type")
-        if btype == "thinking" and not self._thinking_shown and not self._text_started:
+        if btype == "thinking" and not self._status_shown and not self._text_ever_started:
             self._write(thinking_status())
-            self._thinking_shown = True
+            self._status_shown = True
+        elif btype == "text":
+            self._start_text_segment()
         elif btype == "tool_use":
-            self._clear_thinking()
-            prefix = "\n" if self._text_started else ""
-            self._write(f"{prefix}{tool_line(block.get('name', 'tool'))}\n")
+            self._clear_status()
+            self._separate()
+            self._write(tool_line(block.get("name", "tool")))
+            self._any_output = True
+            self._in_text_block = False
 
     def _handle_delta(self, delta: dict) -> None:
         if delta.get("type") != "text_delta":
             return
-        self._clear_thinking()
+        if not self._in_text_block:
+            self._start_text_segment()
         self._write(delta.get("text", ""))
-        self._text_started = True
 
-    def _clear_thinking(self) -> None:
-        if self._thinking_shown:
+    def _start_text_segment(self) -> None:
+        """Shared by an explicit `text` content_block_start and the
+        defensive fallback in _handle_delta for a text_delta arriving with
+        no preceding content_block_start observed."""
+        self._clear_status()
+        self._separate()
+        self._write(text_bullet())
+        self._any_output = True
+        self._text_ever_started = True
+        self._in_text_block = True
+
+    def _separate(self) -> None:
+        """Blank line between this turn's segments (thinking->tool,
+        tool->tool, tool->text, text->tool) - not called within one text
+        block's own deltas. No-op before the first segment of a turn."""
+        if self._any_output:
+            self._write("\n\n")
+
+    def _clear_status(self) -> None:
+        if self._status_shown:
             self._write("\r\x1b[2K")
-            self._thinking_shown = False
+            self._status_shown = False
 
     def finish(self) -> None:
-        if self._text_started:
+        self._clear_status()
+        if self._any_output:
             self._write("\n")

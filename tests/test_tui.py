@@ -29,7 +29,97 @@ def test_text_delta_streams_verbatim_and_clears_no_thinking_indicator():
     renderer.handle({"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "pong"}}})
     renderer.finish()
 
-    assert "".join(chunks) == "pong\n"
+    joined = "".join(chunks)
+    assert "pong" in joined
+    assert joined.endswith("pong\n")
+    assert "\r\x1b[2K" not in joined  # nothing was shown that needed clearing
+
+
+def test_text_block_start_emits_bullet_before_delta_text():
+    chunks, write = _writer()
+    renderer = tui.StreamRenderer(write_fn=write)
+
+    renderer.handle({"type": "stream_event", "event": {"type": "content_block_start", "content_block": {"type": "text"}}})
+    renderer.handle({"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "pong"}}})
+    renderer.finish()
+
+    joined = "".join(chunks)
+    assert tui.BULLET in joined
+    assert joined.index(tui.BULLET) < joined.index("pong")
+
+
+def test_multiple_text_deltas_in_one_block_are_not_separated_by_blank_lines():
+    chunks, write = _writer()
+    renderer = tui.StreamRenderer(write_fn=write)
+
+    renderer.handle({"type": "stream_event", "event": {"type": "content_block_start", "content_block": {"type": "text"}}})
+    renderer.handle({"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "pon"}}})
+    renderer.handle({"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "g"}}})
+    renderer.finish()
+
+    joined = "".join(chunks)
+    assert joined.endswith("pong\n")
+    assert "\n\n" not in joined
+
+
+def test_multiple_tool_use_blocks_separated_by_blank_line():
+    chunks, write = _writer()
+    renderer = tui.StreamRenderer(write_fn=write)
+
+    renderer.handle(
+        {"type": "stream_event", "event": {"type": "content_block_start", "content_block": {"type": "tool_use", "name": "Read"}}}
+    )
+    renderer.handle(
+        {"type": "stream_event", "event": {"type": "content_block_start", "content_block": {"type": "tool_use", "name": "Grep"}}}
+    )
+
+    joined = "".join(chunks)
+    assert "\n\n" in joined
+    assert joined.index("Read") < joined.index("\n\n") < joined.index("Grep")
+
+
+def test_tool_use_then_text_separated_by_blank_line():
+    chunks, write = _writer()
+    renderer = tui.StreamRenderer(write_fn=write)
+
+    renderer.handle(
+        {"type": "stream_event", "event": {"type": "content_block_start", "content_block": {"type": "tool_use", "name": "Read"}}}
+    )
+    renderer.handle({"type": "stream_event", "event": {"type": "content_block_start", "content_block": {"type": "text"}}})
+    renderer.handle({"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "done"}}})
+
+    joined = "".join(chunks)
+    assert "\n\n" in joined
+    assert joined.index("Read") < joined.index("\n\n") < joined.index("done")
+
+
+def test_renderer_start_emits_connecting_status_cleared_by_first_event():
+    chunks, write = _writer()
+    renderer = tui.StreamRenderer(write_fn=write)
+
+    renderer.start()
+    assert any("connecting" in c for c in chunks)
+
+    renderer.handle({"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "hi"}}})
+
+    joined = "".join(chunks)
+    assert "\r\x1b[2K" in joined
+    assert joined.endswith("hi")
+
+
+def test_renderer_finish_clears_leftover_status_with_no_events():
+    """Covers a zero-event error path (e.g. an auth failure before any
+    stream event ever arrives) - start() shouldn't leave a stray
+    "connecting…" on screen."""
+    chunks, write = _writer()
+    renderer = tui.StreamRenderer(write_fn=write)
+
+    renderer.start()
+    renderer.finish()
+
+    joined = "".join(chunks)
+    assert "\r\x1b[2K" in joined
+    assert not joined.endswith("\n")  # no real output, so no trailing newline either
 
 
 def test_thinking_indicator_shown_then_cleared_when_text_starts():
