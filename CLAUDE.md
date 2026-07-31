@@ -7,37 +7,53 @@ prompt/model quality offline to calibrate the tiers this router picks from.
 
 ## Next step (updated 2026-07-31)
 
-`audit_tier2`/`shadow_report` launchd jobs are live on this dev machine
-(`~/Library/LaunchAgents/com.llm-task-router.*.plist`, daily 06:00/06:15,
-`DATABASE_URL=postgresql:///llm_task_router`, logs in
-`~/Library/Logs/llm-task-router/`) — verified with one manual
-`launchctl start` each before trusting the schedule; as of 2026-07-31 the
-schedule hasn't yet had its first unattended fire (next one is today's
-06:00/06:15). `routing_decisions` has grown from 1→3 real shadow-scored
-rows since setup — still short of a meaningful tier 1 vs. tier 2 divergence
-read; periodically re-run `llm-route-shadow-report` (or read
-`shadow_report.log`) as more accumulate (see `docs/drift-and-shadow.md`).
-`is_high_stakes` is separately stuck at 3 labeled rows (needs 6 for
-leave-one-out at all) — unlike `task_type` (101 rows), ordinary traffic may
-not organically produce enough high-stakes-labeled examples; may need
-deliberate seeding rather than passive waiting. This machine instance
-doesn't change the portable recipe in `docs/scheduling-audits.md`.
+**`llm-chat` is being rearchitected into a pure routing/classification layer** —
+full design at `~/.claude/plans/what-s-our-next-goal-jazzy-tome.md` (this
+machine/user's plans directory, not in-repo). Short version: `llm-chat` stops
+trying to render provider output itself (the custom `StreamRenderer`/`tui.py`
+streaming path was chasing feature parity with Claude Code's own interactive
+UI — menus, inline diffs, arrow-key history — a permanent maintenance burden
+against a target this repo doesn't control). New flow: classify the message,
+print the routing decision, spawn a **real native terminal** running
+`claude --model <tier's model> --session-id <sid> "<message>"` with a real
+inherited TTY (same `login()`-shells-out-with-inherited-stdio pattern
+`claude_cli.py` already uses), let the user drive that session with full
+native functionality, and return to `llm-chat`'s prompt when they exit.
+Per-message routing is unchanged and non-negotiable (see
+`docs/llm-chat.md`'s "Architectural decision" section and this project's
+memory — don't relitigate why full-interactive-UX-in-`llm-chat` was rejected,
+it's a structural incompatibility, not an oversight). Existing
+`StreamRenderer`/streaming code is deliberately **not** being deleted as part
+of this pivot — it stays until the spawn model is verified end to end
+(macOS first; Linux/Windows terminal-spawning is unverified) and confirmed
+unreferenced by an actual grep, not assumed. Next concrete steps in the plan:
+commit the already-green, currently-uncommitted word-wrap rewrite first, then
+build `llm_task_router/terminal.py` (the platform-dispatch spawn function).
 
-**`llm-chat` plan mode (`/plan`) and `/clear` shipped 2026-07-31** — see
-`docs/llm-chat.md` for the real-CLI verification (`ExitPlanMode` errors out
-headlessly; the two-turn `--permission-mode plan` → `--resume` flow works
-around that) and the known gap it leaves (execute-leg cost isn't logged to
-`routing_decisions`).
+Separately still true and unaffected by the above: `audit_tier2`/
+`shadow_report` launchd jobs are live on this dev machine
+(`~/Library/LaunchAgents/com.llm-task-router.*.plist`, daily 06:00/06:15) and
+have had their first unattended fire (06:14/06:25 logs, 2026-07-31).
+`routing_decisions` is at 15 rows (13 shadow-scored) — enough for an actual
+divergence read now: `llm-route-shadow-report` shows 30.8% divergence
+(1 escalated / 3 de-escalated, all task_type-driven) and, more importantly,
+that `cheap` only costs ~1.8x less than `mid` per call ($0.1872 vs $0.3433
+avg) — real signal that per-call fixed overhead (Claude Code's system
+prompt + full tool schemas + global `CLAUDE.md`, sent on every call
+regardless of tier) is compressing the tier ladder's cost savings; see
+`docs/rough-edges.md` for the diagnosis, not yet acted on. `is_high_stakes`
+is separately stuck at 4 labeled rows (needs 6) — passive traffic isn't
+producing these; needs deliberate seeding. `audit_tier2.py` has also flagged
+its first real suspect row (id=102, stored label disagrees with neighbors at
+80%) with no command yet to act on it beyond manual SQL.
 
 One thread stays explicitly on hold in favor of letting the audit schedule
-accumulate more data first (deferred three times, most recently
-2026-07-29): **Codex tier calibration** (re-probe reachable Codex models,
-re-run `llm-eval-harness`'s `calibrate-tier` skill) — see
-`docs/rough-edges.md`. Also parked: Windows `select()` support,
-cross-provider session continuity.
+accumulate more data first (deferred four times, most recently 2026-07-31):
+**Codex tier calibration** — see `docs/rough-edges.md`. Also parked:
+Windows `select()` support, cross-provider session continuity.
 
 Don't re-derive this by re-reading the whole file — start here, then jump to
-the referenced doc only if you need the full backstory.
+the referenced doc or plan only if you need the full backstory.
 
 ## Why it's built this way
 

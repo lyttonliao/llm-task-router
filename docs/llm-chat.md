@@ -189,3 +189,27 @@ rather than letting every message fail individually.
 `tests/test_repl.py::test_routable_tiers_against_real_tier_models_with_only_codex_authenticated`
 is pinned against the real `TIER_MODELS` so it starts failing (in the good
 way) the day a Codex tier gets calibrated in.
+
+## Architectural decision: per-message routing vs. interactive UX
+
+`llm-chat` classifies **every message independently** and routes to the appropriate tier — this is
+non-negotiable. Messages within the same session can need different quality floors (a help query
+routes cheap, a debug task routes expensive), and this per-message granularity is the project's
+core value prop.
+
+This design structurally forecloses full Claude Code interactive UX (arrow-key history, menu
+selection, inline diff accept/reject). A session-owned terminal (real Claude Code) and a per-message
+router (regaining control after each response to reclassify) are incompatible — one tool owns the TTY
+continuously, the other intercepts between messages. Rebuilding Claude Code's interactive layer in
+`prompt_toolkit` to bridge that gap trades a one-time engineering cost for permanent maintenance
+burden, since the UI layer diverges every time Anthropic ships a feature there.
+
+**The practical answer**: `llm-chat` provides basic interactivity (readline history via `input()`,
+slash-command dispatch) and cost-aware routing. When a conversation requires more intense/precise
+communication (complex refactoring, high-stakes work, exploration needing iteration), a future
+`/handoff` command will save the session and launch a real `claude --resume` session, handing the
+user full native UX while keeping the routing decisions logged. For now, users escalate to `claude`
+directly when they need it.
+
+This isn't a limitation to work around — it's a design decision with real tradeoffs. Don't revisit
+it.
