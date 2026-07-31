@@ -41,6 +41,36 @@ against the real store. Fixed with `Vector.to_list()`. Any future module
 reading embeddings back out of Postgres should expect the same and verify
 against a real query first.
 
+**Gotcha that cost real audit-trail coverage (found 2026-07-31)**:
+`DATABASE_URL` was only ever set inside the two launchd plists
+(`com.llm-task-router.audit-tier2`/`.shadow-report`), never anywhere else.
+`route()`'s `try/except Exception: pass` around `log_decision()` means a
+missing `DATABASE_URL` fails *silently* — every interactive `llm-chat`/
+`llm-route` invocation had been routing correctly but logging nothing, so
+`routing_decisions` was accumulating zero real usage data despite the
+scheduled jobs running fine on their own. Confirmed against the real local
+DB: 3 rows total, all from a 2026-07-28 manual test, none from any
+interactive session since. A `~/.zshrc` export was tried first and reverted
+the same day — it only covers the shell it's sourced in, and breaks the
+moment `llm-chat` is invoked from a machine/shell where that profile line
+was never added, which cuts against the entire point of `uv tool install
+--editable .` making it callable from anywhere (see "Calling these from any
+directory, on any machine"). Fixed properly via `llm_task_router/
+env_config.py` + `.env` (see that module's docstring and README.md's setup
+step 3) — loaded on `import llm_task_router` itself, resolved next to the
+installed package rather than the caller's shell or `cwd`, so it applies
+identically however/wherever `llm-chat`/`llm-route` is invoked. A real
+shell-exported `DATABASE_URL` still wins over `.env` (`os.environ.setdefault`),
+so the launchd plists' own explicit `EnvironmentVariables` block keeps
+working unchanged.
+
+This remains a reminder worth restating regardless of the fix:
+`route()`'s silent-degrade discipline (correct, for keeping a Postgres
+outage from ever breaking routing) means a misconfigured environment gives
+*zero* signal that logging isn't happening; periodically spot-checking row
+counts (`SELECT count(*) FROM routing_decisions`) is the only way to catch
+this class of gap going forward.
+
 ## Shadow evaluation: live dual-routing without doubling cost
 
 Built 2026-07-28. Distinct from both drift auditing above (re-validates

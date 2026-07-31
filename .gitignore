@@ -5,3 +5,8 @@ __pycache__/
 # Personal notes, not for the shared repo
 GLOSSARY.md
 PROJECT_JOURNAL.md
+
+# Real per-machine values (DATABASE_URL, HF_HUB_OFFLINE, ...) - see
+# .env.example and llm_task_router/env_config.py. Never commit real
+# connection strings/secrets.
+.env

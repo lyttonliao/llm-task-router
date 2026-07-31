@@ -260,31 +260,40 @@ re-applying against an older database that predates shadow evaluation,
 run the three commented `ALTER TABLE ... ADD COLUMN shadow_*` statements at
 the bottom of that file instead of the `CREATE TABLE`.
 
-Export `DATABASE_URL` so the router can reach it (every command below
-assumes this is set in your shell):
+Set `DATABASE_URL` so the router can reach it (every command below assumes
+this is set). Copy `.env.example` to `.env` and fill it in, rather than
+exporting it in your shell profile:
 
 ```bash
-export DATABASE_URL=postgresql:///llm_task_router
+cp .env.example .env
 ```
+
+`llm_task_router/__init__.py` loads `.env` automatically (see
+`env_config.py`) - resolved next to the installed package, not your shell's
+`cwd`, so it's picked up correctly whether you run `llm-route`/`llm-chat`
+from inside this repo or, once installed via `uv tool install --editable .`
+(see "Running `llm-chat` from anywhere" below), from anywhere else. A real
+shell-exported `DATABASE_URL` still overrides whatever `.env` says, so
+`DATABASE_URL=... uv run llm-route ...` one-off overrides keep working
+unchanged. (A shell-profile export was tried first and reverted - it only
+covers the shell it's sourced in, and doesn't help a caller invoking
+`llm-chat` from a machine/shell where that profile line was never added;
+see `docs/drift-and-shadow.md`'s "DATABASE_URL only in launchd plists"
+writeup for the real incident that prompted this.)
 
 ### 4. Seed the tier-2 vector store
 
 Before running this step (or any first call that reaches tier 2 — `embed()`
 in `embeddings.py` lazy-loads `sentence-transformers/all-MiniLM-L6-v2` from
-Hugging Face Hub the first time it's called), make sure `HF_HUB_OFFLINE`
-isn't already set to `1` in your shell — nothing in this repo sets it, but a
-shell profile/container image/another project might:
+Hugging Face Hub the first time it's called), leave `HF_HUB_OFFLINE`
+commented out in your `.env` (see step 3) — it ships commented out in
+`.env.example` for exactly this reason. If it's already `1` with nothing
+cached yet, the first embedding call fails outright: there's no local cache
+for `sentence-transformers` to fall back to, so "offline mode" has nothing
+to serve.
 
-```bash
-export HF_HUB_OFFLINE=0   # or just `unset HF_HUB_OFFLINE`
-```
-
-If it's already `1` with nothing cached yet, the first embedding call fails
-outright: there's no local cache for `sentence-transformers` to fall back
-to, so "offline mode" has nothing to serve.
-
-**Once the model is cached, flip this the other way — set `HF_HUB_OFFLINE=1`.**
-This isn't just an optional preference: without it, every fresh process that
+**Once the model is cached, uncomment `HF_HUB_OFFLINE=1` in `.env`.** This
+isn't just an optional preference: without it, every fresh process that
 imports `embeddings.py` (`llm-route`, `llm-chat`,
 `llm-route-audit-tier2`, `scripts/seed_vector_store.py` — anything that
 touches tier 2) makes a network round-trip to Hugging Face Hub on startup to
@@ -303,20 +312,14 @@ response header the Hub sends back on anonymous requests
 still loads correctly afterward. But since `llm-chat`/`llm-route` are each a
 fresh process per run, `huggingface_hub`'s usual "only warn once" dedup
 resets every time, so it reprints on every single invocation until that
-revalidation call is skipped entirely:
-
-```bash
-export HF_HUB_OFFLINE=1
-```
+revalidation call is skipped entirely by setting `HF_HUB_OFFLINE=1`.
 
 The warning's suggested fix (create a real Hugging Face account token and
 set `HF_TOKEN`) is the *other* valid way to quiet it, but is unnecessary
 overhead here — this repo only ever requests one fixed, small, public model
 name (`MODEL_NAME` in `embeddings.py`), so there's never a reason to check
 for a newer revision, and going offline is simpler than managing a Hub
-credential for a model this project doesn't need auth to use at all. Put
-`export HF_HUB_OFFLINE=1` in your shell profile once the first run below has
-completed and populated the cache (`~/.cache/huggingface/` by default).
+credential for a model this project doesn't need auth to use at all.
 
 Tier 2 starts empty and needs the `llm-eval-harness` sibling repo checked
 out alongside this one (default path `../llm-eval-harness`) to cold-start

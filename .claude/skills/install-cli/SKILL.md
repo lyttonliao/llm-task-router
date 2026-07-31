@@ -59,3 +59,32 @@ which llm-chat
 cd /tmp
 llm-chat
 ```
+
+`/tmp` here is just a stand-in for "some directory that obviously isn't
+`llm-task-router`" — any Unix scratch directory works; the point is proving
+behavior doesn't depend on `cwd` (see `env_config.py`'s `.env` loading,
+which has to hold under exactly this test).
+
+## Debugging: running the installed venv's Python directly
+
+The `llm-chat`/`llm-route` shims only accept their own subcommands (`llm-route
+route "..."`), not an arbitrary inline script — useful for real usage, not
+for probing internals (e.g. confirming what `os.environ` looks like inside
+the installed package, independent of the caller's shell). For that, skip
+the shim and call the isolated venv's own interpreter directly:
+
+```bash
+~/.local/share/uv/tools/llm-task-router/bin/python -c "
+import os
+import llm_task_router
+print(os.environ.get('DATABASE_URL'))
+"
+```
+
+This is the exact same venv `uv tool install --editable .` already built —
+not a second install, not a different mechanism, just reaching past the
+`llm-chat`/`llm-route` wrappers to run one-off Python against the installed
+package. Combine with the `/tmp`-style cwd trick above and `env -u
+DATABASE_URL` to test what a completely clean shell actually sees (used to
+verify `env_config.py`'s `.env` loader works regardless of both `cwd` and
+which shell-profile lines happen to be sourced).
