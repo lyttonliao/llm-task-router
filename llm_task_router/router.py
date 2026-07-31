@@ -377,6 +377,7 @@ def route_and_run(
     *,
     on_event: Callable[[dict], None] | None = None,
     on_decision: Callable[[RouteDecision], None] | None = None,
+    permission_mode: str = "bypassPermissions",
 ) -> tuple[RouteDecision, ProviderResult]:
     """on_decision, if given, fires the moment routing resolves - before the
     (potentially long) provider call starts - so a caller like repl.py can
@@ -384,6 +385,11 @@ def route_and_run(
     lands. on_event is forwarded straight into provider.invoke() for
     per-event streaming (see claude_cli.py); providers that can't stream yet
     (codex_cli.py) accept and ignore it.
+
+    permission_mode is forwarded straight into provider.invoke() too, for
+    repl.py's /plan command - the classification/tier that route() resolves
+    is unaffected either way, this only changes what the resolved provider
+    call is allowed to do once it runs.
 
     Once the provider call completes, the real cost/duration are written
     back onto the row route() already logged (decision.decision_log_id) via
@@ -402,6 +408,7 @@ def route_and_run(
         decision.model,
         session_id=request.session_id,
         on_event=on_event,
+        permission_mode=permission_mode,
     )
     if decision.decision_log_id is not None:
         try:

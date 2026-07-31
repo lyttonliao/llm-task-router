@@ -12,4 +12,5 @@ class Provider(Protocol):
         *,
         session_id: str | None = None,
         on_event: Callable[[dict], None] | None = None,
+        permission_mode: str = "bypassPermissions",
     ) -> ProviderResult: ...

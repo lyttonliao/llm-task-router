@@ -195,6 +195,37 @@ def test_builds_expected_command_without_cost_guardrail_flags_by_default():
     assert kwargs["text"] is True
 
 
+def test_permission_mode_defaults_to_bypass_permissions():
+    """Regression guard: omitting permission_mode entirely must produce the
+    exact same command as before this parameter existed."""
+    fake_proc = _FakeProcess(stdout_lines=[_result_line()])
+    with (
+        patch("llm_task_router.providers.claude_cli.subprocess.run", return_value=_auth_ok()),
+        patch("llm_task_router.providers.claude_cli.subprocess.Popen", return_value=fake_proc) as mock_popen,
+        patch("llm_task_router.providers.claude_cli.select.select", side_effect=_always_ready()),
+    ):
+        invoke("do the task", model="haiku")
+
+    cmd = mock_popen.call_args[0][0]
+    assert cmd[cmd.index("--permission-mode") + 1] == "bypassPermissions"
+
+
+def test_permission_mode_plan_flows_into_command():
+    """repl.py's /plan command needs --permission-mode plan on the real
+    command line - confirmed against a real `claude -p --permission-mode
+    plan` call (2026-07-31) to genuinely restrict to read-only tools."""
+    fake_proc = _FakeProcess(stdout_lines=[_result_line()])
+    with (
+        patch("llm_task_router.providers.claude_cli.subprocess.run", return_value=_auth_ok()),
+        patch("llm_task_router.providers.claude_cli.subprocess.Popen", return_value=fake_proc) as mock_popen,
+        patch("llm_task_router.providers.claude_cli.select.select", side_effect=_always_ready()),
+    ):
+        invoke("do the task", model="haiku", permission_mode="plan")
+
+    cmd = mock_popen.call_args[0][0]
+    assert cmd[cmd.index("--permission-mode") + 1] == "plan"
+
+
 def test_disable_tools_true_adds_strip_flags():
     """disable_tools is opt-in for internal one-shot callers (e.g. router.py's
     tier-3 classifier) that shouldn't inherit llm-chat's full-functionality

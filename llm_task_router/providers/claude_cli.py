@@ -156,6 +156,7 @@ def invoke(
     session_id: str | None = None,
     on_event: Callable[[dict], None] | None = None,
     disable_tools: bool = False,
+    permission_mode: str = "bypassPermissions",
 ) -> ProviderResult:
     """disable_tools (default False - every existing call site/test is
     unaffected) adds --disallowed-tools "*" --strict-mcp-config, the same
@@ -165,7 +166,16 @@ def invoke(
     one-shot calls (e.g. router.py's tier-3 classification fallback) that
     have no business running tools and shouldn't inherit llm-chat's
     full-functionality cost profile just because they share this adapter -
-    llm-chat's own real messages must never pass this, by design."""
+    llm-chat's own real messages must never pass this, by design.
+
+    permission_mode (default "bypassPermissions", every existing call site
+    unaffected) exists for repl.py's /plan command: confirmed against a real
+    call (2026-07-31) that `--permission-mode plan` genuinely restricts to
+    read-only tools (a Write attempt was refused), but the `ExitPlanMode`
+    tool errors out headlessly ("exists but is not enabled in this
+    context") - there is no structured plan handoff in `-p` mode, only
+    whatever the model says in its final text `result` once it can't call
+    that tool. repl.py treats that prose as the plan to show the user."""
     authenticated, auth_error = check_auth()
     if not authenticated:
         return ProviderResult(text="", cost_usd=0.0, duration_ms=0, error=f"auth check failed: {auth_error}")
@@ -181,7 +191,7 @@ def invoke(
         "--include-partial-messages",
         "--verbose",
         "--permission-mode",
-        "bypassPermissions",
+        permission_mode,
     ]
     if disable_tools:
         cmd += ["--disallowed-tools", "*", "--strict-mcp-config"]

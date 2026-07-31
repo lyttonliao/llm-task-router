@@ -5,6 +5,7 @@ import pytest
 
 from llm_task_router.repl import (
     HELP_TEXT,
+    PLAN_EXECUTE_PROMPT,
     check_provider_auth,
     chat_loop,
     ensure_provider_authenticated,
@@ -392,6 +393,196 @@ def test_chat_loop_survives_unexpected_exception_from_route_and_run():
 
     assert mock_route.call_count == 2
     assert any("boom" in str(call) for call in print_fn.call_args_list)
+
+
+# --- /clear ---
+
+
+def test_clear_resets_session_id_for_subsequent_messages():
+    decision = RouteDecision(tier="cheap", provider="claude", model="haiku", reason="r")
+    result = ProviderResult(text="hi", cost_usd=0.001, duration_ms=100)
+
+    with patch("llm_task_router.repl.route_and_run", return_value=(decision, result)) as mock_route:
+        chat_loop(input_fn=Mock(side_effect=["first", "/clear", "second", "/exit"]), print_fn=lambda *a: None)
+
+    assert mock_route.call_count == 2
+    (request_1,), _ = mock_route.call_args_list[0]
+    (request_2,), _ = mock_route.call_args_list[1]
+    assert uuid.UUID(request_1.session_id)
+    assert uuid.UUID(request_2.session_id)
+    assert request_1.session_id != request_2.session_id
+
+
+def test_clear_prints_confirmation_and_does_not_route():
+    print_fn = Mock()
+    with patch("llm_task_router.repl.route_and_run") as mock_route:
+        chat_loop(input_fn=Mock(side_effect=["/clear", "/exit"]), print_fn=print_fn)
+
+    mock_route.assert_not_called()
+    assert any("session cleared" in str(call) for call in print_fn.call_args_list)
+
+
+# --- /plan ---
+
+
+def test_plan_without_description_prints_usage_and_does_not_route():
+    print_fn = Mock()
+    with patch("llm_task_router.repl.route_and_run") as mock_route:
+        chat_loop(input_fn=Mock(side_effect=["/plan", "/exit"]), print_fn=print_fn)
+
+    mock_route.assert_not_called()
+    assert any("usage: /plan" in str(call) for call in print_fn.call_args_list)
+
+
+def test_plan_routes_with_permission_mode_plan():
+    decision = RouteDecision(tier="cheap", provider="claude", model="haiku", reason="r")
+    plan_result = ProviderResult(text="here is the plan", cost_usd=0.001, duration_ms=100)
+    captured = {}
+
+    def fake_route_and_run(request, *, on_event=None, on_decision=None, permission_mode="bypassPermissions"):
+        captured["description"] = request.description
+        captured["permission_mode"] = permission_mode
+        on_decision(decision)
+        return decision, plan_result
+
+    with (
+        patch("llm_task_router.repl.route_and_run", side_effect=fake_route_and_run),
+        patch("llm_task_router.repl.PROVIDERS", {"claude": Mock()}),
+    ):
+        chat_loop(
+            input_fn=Mock(side_effect=["/plan write a function", "n", "/exit"]),
+            print_fn=lambda *a: None,
+            write_fn=lambda t: None,
+        )
+
+    assert captured["description"] == "write a function"
+    assert captured["permission_mode"] == "plan"
+
+
+def test_plan_declines_execution_by_default_and_never_invokes_provider():
+    decision = RouteDecision(tier="cheap", provider="claude", model="haiku", reason="r")
+    plan_result = ProviderResult(text="here is the plan", cost_usd=0.001, duration_ms=100)
+    fake_provider = Mock()
+
+    def fake_route_and_run(request, *, on_event=None, on_decision=None, permission_mode="bypassPermissions"):
+        on_decision(decision)
+        return decision, plan_result
+
+    print_fn = Mock()
+    with (
+        patch("llm_task_router.repl.route_and_run", side_effect=fake_route_and_run),
+        patch("llm_task_router.repl.PROVIDERS", {"claude": fake_provider}),
+    ):
+        chat_loop(
+            input_fn=Mock(side_effect=["/plan write a function", "n", "/exit"]),
+            print_fn=print_fn,
+            write_fn=lambda t: None,
+        )
+
+    fake_provider.invoke.assert_not_called()
+    assert any("plan discarded" in str(call) for call in print_fn.call_args_list)
+
+
+def test_plan_eof_on_approval_prompt_treated_as_decline():
+    decision = RouteDecision(tier="cheap", provider="claude", model="haiku", reason="r")
+    plan_result = ProviderResult(text="here is the plan", cost_usd=0.001, duration_ms=100)
+    fake_provider = Mock()
+
+    def fake_route_and_run(request, *, on_event=None, on_decision=None, permission_mode="bypassPermissions"):
+        on_decision(decision)
+        return decision, plan_result
+
+    with (
+        patch("llm_task_router.repl.route_and_run", side_effect=fake_route_and_run),
+        patch("llm_task_router.repl.PROVIDERS", {"claude": fake_provider}),
+    ):
+        chat_loop(
+            input_fn=Mock(side_effect=["/plan write a function", EOFError(), "/exit"]),
+            print_fn=lambda *a: None,
+            write_fn=lambda t: None,
+        )
+
+    fake_provider.invoke.assert_not_called()
+
+
+def test_plan_executes_via_direct_provider_invoke_on_approval_reusing_resolved_model():
+    """The execute leg must bypass route_and_run()/route() entirely and call
+    the resolved provider's invoke() directly with the plan call's own
+    model/session_id - a fixed "proceed" confirmation has no classification
+    signal of its own and must not be reclassified (see _run_plan_turn's
+    docstring)."""
+    decision = RouteDecision(tier="flagship", provider="claude", model="opus", reason="r")
+    plan_result = ProviderResult(text="here is the plan", cost_usd=0.001, duration_ms=100)
+    exec_result = ProviderResult(text="done", cost_usd=0.01, duration_ms=500)
+    fake_provider = Mock()
+    fake_provider.invoke = Mock(return_value=exec_result)
+    captured = {}
+
+    def fake_route_and_run(request, *, on_event=None, on_decision=None, permission_mode="bypassPermissions"):
+        captured["session_id"] = request.session_id
+        on_decision(decision)
+        return decision, plan_result
+
+    with (
+        patch("llm_task_router.repl.route_and_run", side_effect=fake_route_and_run),
+        patch("llm_task_router.repl.PROVIDERS", {"claude": fake_provider}),
+    ):
+        chat_loop(
+            input_fn=Mock(side_effect=["/plan write a function", "y", "/exit"]),
+            print_fn=lambda *a: None,
+            write_fn=lambda t: None,
+        )
+
+    fake_provider.invoke.assert_called_once()
+    args, kwargs = fake_provider.invoke.call_args
+    assert args == (PLAN_EXECUTE_PROMPT, "opus")
+    assert kwargs["session_id"] == captured["session_id"]
+    assert "on_event" in kwargs
+
+
+def test_plan_execute_leg_error_prints_error_not_footer():
+    decision = RouteDecision(tier="cheap", provider="claude", model="haiku", reason="r")
+    plan_result = ProviderResult(text="here is the plan", cost_usd=0.001, duration_ms=100)
+    exec_error_result = ProviderResult(text="", cost_usd=0.0, duration_ms=0, error="auth check failed: not logged in")
+    fake_provider = Mock()
+    fake_provider.invoke = Mock(return_value=exec_error_result)
+
+    def fake_route_and_run(request, *, on_event=None, on_decision=None, permission_mode="bypassPermissions"):
+        on_decision(decision)
+        return decision, plan_result
+
+    print_fn = Mock()
+    with (
+        patch("llm_task_router.repl.route_and_run", side_effect=fake_route_and_run),
+        patch("llm_task_router.repl.PROVIDERS", {"claude": fake_provider}),
+    ):
+        chat_loop(
+            input_fn=Mock(side_effect=["/plan write a function", "y", "/exit"]),
+            print_fn=print_fn,
+            write_fn=lambda t: None,
+        )
+
+    assert any("error: auth check failed: not logged in" in str(call) for call in print_fn.call_args_list)
+
+
+def test_plan_error_on_plan_call_itself_skips_approval_prompt():
+    decision = RouteDecision(tier="cheap", provider="claude", model="haiku", reason="r")
+    plan_error_result = ProviderResult(text="", cost_usd=0.0, duration_ms=0, error="auth check failed: not logged in")
+
+    def fake_route_and_run(request, *, on_event=None, on_decision=None, permission_mode="bypassPermissions"):
+        on_decision(decision)
+        return decision, plan_error_result
+
+    input_fn = Mock(side_effect=["/plan write a function", "/exit"])
+    with (
+        patch("llm_task_router.repl.route_and_run", side_effect=fake_route_and_run),
+        patch("llm_task_router.repl.PROVIDERS", {"claude": Mock()}),
+    ):
+        chat_loop(input_fn=input_fn, print_fn=lambda *a: None, write_fn=lambda t: None)
+
+    # only 2 input_fn calls total (the /plan line, the /exit line) - no
+    # "Execute this plan?" prompt was ever issued after a failed plan call
+    assert input_fn.call_count == 2
 
 
 # --- main ---

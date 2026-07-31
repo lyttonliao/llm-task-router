@@ -342,43 +342,28 @@ class StreamRenderer:
         self._buffer_text(delta.get("text", ""))
 
     def _buffer_text(self, text: str) -> None:
-        """Process streaming text. Complete lines (with \\n) are wrapped and
-        output immediately. Partial lines stream out as-is for immediate
-        visual feedback, and will be wrapped on finish if needed."""
+        """Buffer text and output complete lines wrapped at terminal width.
+        Partial lines are kept in buffer for real-time output on finish()."""
         if not text:
             return
 
-        # Split on newlines: everything before last \n is complete, after is partial
-        if "\n" in text:
-            parts = text.split("\n")
-            # All parts except the last (which may be empty after final \n)
-            for part in parts[:-1]:
-                # Combine with any buffered partial line from previous delta
-                complete_line = self._line_buffer + part
-                self._line_buffer = ""
-                # Wrap and output the complete line
-                wrapped = wrap_text(complete_line, self._terminal_width)
-                self._write(wrapped)
-                self._write("\n")
-            # Last part after final \n (may be empty)
-            if parts[-1]:
-                self._line_buffer += parts[-1]
-                self._write(parts[-1])
-        else:
-            # No newline - this is a partial line, buffer and output for streaming
-            self._line_buffer += text
-            self._write(text)
+        self._line_buffer += text
+
+        # Process complete lines (those ending with \n)
+        while "\n" in self._line_buffer:
+            line, self._line_buffer = self._line_buffer.split("\n", 1)
+            # Wrap if line exceeds terminal width
+            if len(line) > self._terminal_width:
+                wrapped = wrap_text(line, self._terminal_width)
+            else:
+                wrapped = line
+            self._write(wrapped)
+            self._write("\n")
 
     def _flush_remaining_text(self) -> None:
-        """On finish, wrap any remaining partial line if it exceeds terminal width."""
+        """On finish, output any remaining partial line (without wrapping)."""
         if self._line_buffer:
-            # Rewrap the line in case it accumulated beyond terminal width
-            wrapped = wrap_text(self._line_buffer, self._terminal_width)
-            if wrapped != self._line_buffer:
-                # Need to replace what we already wrote with wrapped version
-                # This is tricky because we can't un-write text that was already streamed
-                # So we only wrap if it's still buffered and hasn't been written
-                pass
+            self._write(self._line_buffer)
             self._line_buffer = ""
 
     def _start_text_segment(self) -> None:

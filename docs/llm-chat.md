@@ -142,9 +142,34 @@ text wraps. Doing it properly needs raw terminal mode (`termios`/`tty`) with
 a hand-rolled line editor — declined twice as a much bigger build than
 everything else in this pass. Back to a plain `tui.prompt()`.
 
-**Plan mode is explicitly deferred** — a future two-turn flow
-(`--permission-mode plan` to produce a plan, a follow-up `--resume` call to
-execute it), noted but not designed further until needed.
+**Plan mode (`/plan <description>`), implemented 2026-07-31** — the
+two-turn flow sketched above, built once real `claude -p` behavior was
+checked instead of assumed. Confirmed against a real call: `--permission-mode
+plan` genuinely restricts the model to read-only tools (a `Write` attempt was
+refused), but the `ExitPlanMode` tool errors out headlessly ("exists but is
+not enabled in this context") — there is no structured plan handoff in `-p`
+mode, only whatever the model says in its final text `result` once it can't
+call that tool, which `repl.py` shows the user as-is. On approval, the
+execute leg deliberately bypasses `route_and_run()`/`route()` entirely and
+calls `PROVIDERS[decision.provider].invoke()` directly with the plan call's
+already-resolved `decision.model`, `--resume`-ing the same session — a fixed
+"proceed" confirmation has no real classification signal of its own and
+would misroute on that lack of signal if run back through `route()`.
+Consequence: the execute leg's real cost/duration are never written to
+`routing_decisions` (no second `route()` call means no second row to attach
+them to) — a real gap in shadow-eval cost accounting for any conversation
+that uses `/plan`, not yet addressed. `claude_cli.invoke()`/`codex_cli.invoke()`
+both gained a `permission_mode: str = "bypassPermissions"` parameter (Codex's
+is accepted-but-ignored, same conformance pattern as `on_event` — `codex
+exec` has no plan-mode analog) to carry this through
+`route_and_run()` unchanged for every existing caller.
+
+**`/clear`, added alongside plan mode (2026-07-31)** — reassigns
+`chat_loop()`'s `session_id` local to a fresh uuid, the one deliberate
+exception to "generated once per run" (see `chat_loop()`'s docstring). The
+next message establishes a brand new `claude` session instead of
+`--resume`-ing the old one; no flag or provider-side "forget history" call
+exists to mirror, this is purely a client-side pointer swap.
 
 **Login always defers to the provider's own interactive command.**
 `claude_cli.login()`/`codex_cli.login()` shell out with inherited stdio to

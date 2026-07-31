@@ -5,24 +5,35 @@ that clears a quality floor for that task category, then actually run it.
 The live-routing counterpart to `llm-eval-harness`, which benchmarks
 prompt/model quality offline to calibrate the tiers this router picks from.
 
-## Next step (updated 2026-07-30)
+## Next step (updated 2026-07-31)
 
 `audit_tier2`/`shadow_report` launchd jobs are live on this dev machine
 (`~/Library/LaunchAgents/com.llm-task-router.*.plist`, daily 06:00/06:15,
 `DATABASE_URL=postgresql:///llm_task_router`, logs in
 `~/Library/Logs/llm-task-router/`) — verified with one manual
-`launchctl start` each before trusting the schedule. `routing_decisions`
-will accumulate real shadow-comparison data day over day; periodically
-re-run `llm-route-shadow-report` (or read `shadow_report.log`) once more
-than the current 1 real shadow-scored row exists, to judge tier 1 vs. tier 2
-divergence (see `docs/drift-and-shadow.md`). This machine instance doesn't
-change the portable recipe in `docs/scheduling-audits.md`.
+`launchctl start` each before trusting the schedule; as of 2026-07-31 the
+schedule hasn't yet had its first unattended fire (next one is today's
+06:00/06:15). `routing_decisions` has grown from 1→3 real shadow-scored
+rows since setup — still short of a meaningful tier 1 vs. tier 2 divergence
+read; periodically re-run `llm-route-shadow-report` (or read
+`shadow_report.log`) as more accumulate (see `docs/drift-and-shadow.md`).
+`is_high_stakes` is separately stuck at 3 labeled rows (needs 6 for
+leave-one-out at all) — unlike `task_type` (101 rows), ordinary traffic may
+not organically produce enough high-stakes-labeled examples; may need
+deliberate seeding rather than passive waiting. This machine instance
+doesn't change the portable recipe in `docs/scheduling-audits.md`.
 
-Two threads stay explicitly on hold in favor of letting that schedule
-accumulate data first (deferred twice, most recently 2026-07-29): **Codex
-tier calibration** (re-probe reachable Codex models, re-run
-`llm-eval-harness`'s `calibrate-tier` skill) and **`llm-chat` plan mode**
-(see `docs/rough-edges.md`). Also parked: Windows `select()` support,
+**`llm-chat` plan mode (`/plan`) and `/clear` shipped 2026-07-31** — see
+`docs/llm-chat.md` for the real-CLI verification (`ExitPlanMode` errors out
+headlessly; the two-turn `--permission-mode plan` → `--resume` flow works
+around that) and the known gap it leaves (execute-leg cost isn't logged to
+`routing_decisions`).
+
+One thread stays explicitly on hold in favor of letting the audit schedule
+accumulate more data first (deferred three times, most recently
+2026-07-29): **Codex tier calibration** (re-probe reachable Codex models,
+re-run `llm-eval-harness`'s `calibrate-tier` skill) — see
+`docs/rough-edges.md`. Also parked: Windows `select()` support,
 cross-provider session continuity.
 
 Don't re-derive this by re-reading the whole file — start here, then jump to

@@ -31,7 +31,15 @@ from llm_task_router.tiers import TIER_MODELS
 HELP_TEXT = """Commands:
   /help          show this message
   /exit, /quit   leave the chat (Ctrl+D also works)
+  /clear         start a new conversation (forgets history so far)
+  /plan <desc>   propose a plan for <desc> without changing anything,
+                 then ask to execute it
 """
+
+# Fixed follow-up sent on plan approval, not the user's own words - see
+# _run_plan_turn()'s docstring for why the execute leg bypasses
+# route_and_run()/route() and reuses the plan call's already-resolved model.
+PLAN_EXECUTE_PROMPT = "Proceed with the plan above."
 
 
 def check_provider_auth(name: str, module) -> tuple[bool, str]:
@@ -139,12 +147,96 @@ def format_response(decision, result) -> str:
     return f"{header}\n{result.text}\n{tui.footer(result)}"
 
 
+def _run_plan_turn(
+    description: str, session_id: str, *, input_fn=input, print_fn=print, write_fn=tui.default_write
+) -> None:
+    """/plan's two-turn flow. The first call routes normally (real
+    classification, real decision_log row) but with permission_mode="plan" -
+    confirmed against a real `claude -p --permission-mode plan` call
+    (2026-07-31) to genuinely restrict to read-only tools (a Write attempt
+    was refused), but `ExitPlanMode` errors out headlessly ("exists but is
+    not enabled in this context"): there is no structured plan handoff in
+    `-p` mode, so the model's plan just surfaces as ordinary text in
+    result.text, streamed and printed the same as any other response.
+
+    On approval, the second call deliberately bypasses route_and_run()/
+    route() entirely and calls PROVIDERS[decision.provider].invoke()
+    directly with the plan call's already-resolved decision.model - a fixed
+    "proceed" message has no real classification signal of its own (it would
+    misroute on that lack of signal), and the point is to continue the same
+    task at the same tier, not reclassify a one-word confirmation. Also
+    deliberately not logged as a second routing_decisions row for the same
+    reason: it isn't a new routing decision, just a continuation of the
+    first one - confirmed end to end against a real session (plan call
+    correctly withheld a file write, --resume + bypassPermissions correctly
+    performed it)."""
+    request = TaskRequest(description=description, session_id=session_id)
+    renderer = tui.StreamRenderer(write_fn=write_fn)
+
+    def on_decision(d):
+        print_fn(f"{tui.style(tui.DIM)}[plan mode - read-only]{tui.style(tui.RESET)}")
+        print_fn(tui.header(d))
+        renderer.start()
+
+    try:
+        decision, result = route_and_run(
+            request,
+            on_event=renderer.handle,
+            on_decision=on_decision,
+            permission_mode="plan",
+        )
+    except Exception as exc:
+        print_fn(f"[internal error] {exc!r} - plan not sent, session continues")
+        return
+
+    renderer.finish()
+    if result.error:
+        print_fn(tui.error_line(result.error))
+        return
+    print_fn(tui.footer(result))
+
+    try:
+        answer = input_fn("Execute this plan? [y/N] ").strip().lower()
+    except EOFError:
+        answer = "n"
+
+    if answer not in ("y", "yes"):
+        print_fn("plan discarded - staying in chat")
+        return
+
+    provider = PROVIDERS[decision.provider]
+    exec_renderer = tui.StreamRenderer(write_fn=write_fn)
+    print_fn()
+    print_fn(tui.header(decision))
+    exec_renderer.start()
+
+    try:
+        exec_result = provider.invoke(
+            PLAN_EXECUTE_PROMPT,
+            decision.model,
+            session_id=session_id,
+            on_event=exec_renderer.handle,
+        )
+    except Exception as exc:
+        print_fn(f"[internal error] {exc!r} - plan execution not sent")
+        return
+
+    exec_renderer.finish()
+    if exec_result.error:
+        print_fn(tui.error_line(exec_result.error))
+    else:
+        print_fn(tui.footer(exec_result))
+
+
 def chat_loop(*, input_fn=input, print_fn=print, write_fn=tui.default_write) -> None:
     """One session_id, generated once here (not per message), is attached to
     every TaskRequest built in this loop - route_and_run() -> claude_cli.invoke()
     turns that into --session-id on the first call and --resume on every call
     after, so conversation history continues even as the classifier sends
-    different messages to different Claude tiers. A message that routes to a
+    different messages to different Claude tiers. /clear reassigns this same
+    local variable to a fresh uuid mid-loop - the one deliberate exception to
+    "generated once" - so the next message establishes a brand new `claude`
+    session instead of --resume-ing the old one. A message that routes to a
     provider the user skipped at login needs no special handling here:
     invoke() already runs its own check_auth() first, so it naturally comes
     back as ProviderResult(error="auth check failed: ..."), which flows
@@ -190,6 +282,18 @@ def chat_loop(*, input_fn=input, print_fn=print, write_fn=tui.default_write) -> 
             break
         if line == "/help":
             print_fn(HELP_TEXT)
+            continue
+        if line == "/clear":
+            session_id = str(uuid.uuid4())
+            print_fn("session cleared - starting a new conversation")
+            continue
+        if line == "/plan" or line.startswith("/plan "):
+            description = line[len("/plan") :].strip()
+            if not description:
+                print_fn("usage: /plan <description>")
+                continue
+            print_fn()
+            _run_plan_turn(description, session_id, input_fn=input_fn, print_fn=print_fn, write_fn=write_fn)
             continue
         if line.startswith("/"):
             print_fn(f"unknown command: {line} (try /help)")

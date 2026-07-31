@@ -751,7 +751,7 @@ def test_route_and_run_invokes_resolved_provider():
         decision, result = route_and_run(request)
 
     mock_invoke.assert_called_once_with(
-        "summarize this report", "haiku", session_id=None, on_event=None
+        "summarize this report", "haiku", session_id=None, on_event=None, permission_mode="bypassPermissions"
     )
     assert decision.tier == "cheap"
     assert result is fake_result
@@ -772,8 +772,39 @@ def test_route_and_run_threads_session_id_through_to_invoke():
         route_and_run(request)
 
     mock_invoke.assert_called_once_with(
-        "summarize this report", "haiku", session_id="fixed-uuid", on_event=None
+        "summarize this report", "haiku", session_id="fixed-uuid", on_event=None, permission_mode="bypassPermissions"
     )
+
+
+def test_route_and_run_defaults_permission_mode_to_bypass_permissions():
+    request = TaskRequest(
+        description="summarize this report", task_type="summarization", domain="other"
+    )
+    fake_result = ProviderResult(text="summary here", cost_usd=0.001, duration_ms=200)
+
+    with patch(
+        "llm_task_router.router.claude_cli.invoke", return_value=fake_result
+    ) as mock_invoke:
+        route_and_run(request)
+
+    assert mock_invoke.call_args.kwargs["permission_mode"] == "bypassPermissions"
+
+
+def test_route_and_run_forwards_permission_mode_to_invoke():
+    """repl.py's /plan command needs this to reach --permission-mode plan on
+    the real claude_cli call - the classification/tier route() resolves is
+    unaffected either way, only what the resolved provider call may do."""
+    request = TaskRequest(
+        description="summarize this report", task_type="summarization", domain="other"
+    )
+    fake_result = ProviderResult(text="summary here", cost_usd=0.001, duration_ms=200)
+
+    with patch(
+        "llm_task_router.router.claude_cli.invoke", return_value=fake_result
+    ) as mock_invoke:
+        route_and_run(request, permission_mode="plan")
+
+    assert mock_invoke.call_args.kwargs["permission_mode"] == "plan"
 
 
 def test_route_and_run_forwards_on_event_to_invoke():

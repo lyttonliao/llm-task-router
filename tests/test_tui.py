@@ -87,6 +87,7 @@ def test_tool_use_then_text_separated_by_blank_line():
     )
     renderer.handle({"type": "stream_event", "event": {"type": "content_block_start", "content_block": {"type": "text"}}})
     renderer.handle({"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "done"}}})
+    renderer.finish()
 
     joined = "".join(chunks)
     assert "\n\n" in joined
@@ -101,10 +102,11 @@ def test_renderer_start_emits_connecting_status_cleared_by_first_event():
     assert any("connecting" in c for c in chunks)
 
     renderer.handle({"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "hi"}}})
+    renderer.finish()
 
     joined = "".join(chunks)
     assert "\r\x1b[2K" in joined
-    assert joined.endswith("hi")
+    assert joined.endswith("hi\n")
 
 
 def test_renderer_finish_clears_leftover_status_with_no_events():
@@ -130,11 +132,12 @@ def test_thinking_indicator_shown_then_cleared_when_text_starts():
     assert any("thinking" in c for c in chunks)
 
     renderer.handle({"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "hi"}}})
+    renderer.finish()
 
     # the clear sequence (cursor-return + erase-line) must appear before the real text
     joined = "".join(chunks)
     assert "\r\x1b[2K" in joined
-    assert joined.endswith("hi")
+    assert joined.endswith("hi\n")
 
 
 def test_tool_use_block_renders_one_line_bullet_with_tool_name():

@@ -94,6 +94,7 @@ def invoke(
     *,
     session_id: str | None = None,
     on_event: Callable[[dict], None] | None = None,
+    permission_mode: str = "bypassPermissions",
 ) -> ProviderResult:
     """session_id is accepted for Provider-protocol conformance but ignored:
     unlike `claude -p --session-id`/`--resume`, `codex exec` has no flag to
@@ -112,7 +113,13 @@ def invoke(
     here yet. Wiring it would mean switching this adapter to parse `codex
     exec --json`'s JSONL instead, which is a real, not-yet-done piece of
     work, same as claude_cli.py's stream-json switch was - not worth doing
-    speculatively while no tier routes to Codex at all."""
+    speculatively while no tier routes to Codex at all.
+
+    permission_mode is accepted-but-ignored too: `codex exec` already runs
+    non-interactively at `approval: never` by default (see module docstring)
+    and has no plan-mode analog to claude_cli.py's `--permission-mode plan`
+    - repl.py's /plan command is unreachable through Codex anyway since no
+    tier routes to it."""
     return _invoke_without_session(prompt, model)
 
 
