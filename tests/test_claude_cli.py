@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 from unittest.mock import patch
 
@@ -338,26 +339,82 @@ def test_nonzero_exit_code_returns_error_from_stderr():
     assert result.text == ""
 
 
-def test_timeout_returns_timeout_error_without_ever_calling_readline_past_deadline():
-    """Popen has no timeout= kwarg for an incrementally-read stream, so the
-    deadline is enforced by comparing time.monotonic() against a target
-    computed at the start of _drain() - mock monotonic to jump straight past
-    that deadline on the very first loop check, with select.select reporting
-    nothing ready (a real hang would never make a stream ready), so this
-    exercises the deadline branch deterministically instead of a real 300s
-    wait."""
+def test_timeout_is_opt_in_via_env_var():
+    """No default wall-clock ceiling any more (see _resolve_timeout_s()'s
+    docstring - two prior fixed defaults, 60s then 300s, both turned out to
+    be arbitrary guesses a real session blew past). LLM_CHAT_TIMEOUT_S is
+    the only way to get a deadline at all now. Mock monotonic to jump
+    straight past that deadline on the very first loop check, with
+    select.select reporting nothing ready (a real hang would never make a
+    stream ready), so this exercises the deadline branch deterministically
+    instead of a real wait."""
     fake_proc = _FakeProcess(stdout_lines=[], stderr_lines=[])
     with (
         patch("llm_task_router.providers.claude_cli.subprocess.run", return_value=_auth_ok()),
         patch("llm_task_router.providers.claude_cli.subprocess.Popen", return_value=fake_proc),
         patch("llm_task_router.providers.claude_cli.select.select", return_value=([], [], [])),
-        patch("llm_task_router.providers.claude_cli.time.monotonic", side_effect=[0, 1000]),
+        patch("llm_task_router.providers.claude_cli.time.monotonic", side_effect=[0, 100]),
+        patch.dict("os.environ", {"LLM_CHAT_TIMEOUT_S": "60"}),
     ):
         result = invoke("do the task", model="haiku")
 
     assert result.error == "timeout"
-    assert result.duration_ms == 300_000
+    assert result.duration_ms == 60_000
     assert fake_proc.killed is True
+
+
+def test_no_env_var_means_no_deadline_ever_fires_regardless_of_elapsed_time():
+    """Regression guard for the "no default ceiling" behavior itself: even
+    with time.monotonic() reporting a huge elapsed gap between loop checks,
+    a call with no LLM_CHAT_TIMEOUT_S set must never time out - it should
+    keep waiting (here, immediately see EOF and finish normally) rather than
+    killing an in-progress call."""
+    fake_proc = _FakeProcess(stdout_lines=[_result_line()])
+    with (
+        patch("llm_task_router.providers.claude_cli.subprocess.run", return_value=_auth_ok()),
+        patch("llm_task_router.providers.claude_cli.subprocess.Popen", return_value=fake_proc),
+        patch("llm_task_router.providers.claude_cli.select.select", side_effect=_always_ready()),
+        patch("llm_task_router.providers.claude_cli.time.monotonic", side_effect=[0, 10_000_000]),
+        patch.dict("os.environ", {}, clear=False),
+    ):
+        os.environ.pop("LLM_CHAT_TIMEOUT_S", None)
+        result = invoke("do the task", model="haiku")
+
+    assert result.error == ""
+    assert result.text == "ok"
+    assert fake_proc.killed is False
+
+
+def test_drain_passes_none_timeout_to_select_when_no_deadline_is_set():
+    """The no-deadline case must actually reach select.select() as
+    timeout=None (blocking indefinitely, still Ctrl-C-interruptible) rather
+    than some accidental sentinel like 0 or -1."""
+    fake_proc = _FakeProcess(stdout_lines=[_result_line()])
+    seen_timeouts = []
+
+    def _capture_select(rlist, wlist, xlist, timeout):
+        seen_timeouts.append(timeout)
+        return _always_ready()(rlist, wlist, xlist, timeout)
+
+    with (
+        patch("llm_task_router.providers.claude_cli.subprocess.run", return_value=_auth_ok()),
+        patch("llm_task_router.providers.claude_cli.subprocess.Popen", return_value=fake_proc),
+        patch("llm_task_router.providers.claude_cli.select.select", side_effect=_capture_select),
+    ):
+        os.environ.pop("LLM_CHAT_TIMEOUT_S", None)
+        invoke("do the task", model="haiku")
+
+    assert seen_timeouts and all(t is None for t in seen_timeouts)
+
+
+def test_resolve_timeout_s_returns_none_by_default():
+    os.environ.pop("LLM_CHAT_TIMEOUT_S", None)
+    assert claude_cli_module._resolve_timeout_s() is None
+
+
+def test_resolve_timeout_s_falls_back_to_none_on_unparseable_env_var():
+    with patch.dict("os.environ", {"LLM_CHAT_TIMEOUT_S": "not-a-number"}):
+        assert claude_cli_module._resolve_timeout_s() is None
 
 
 def test_no_result_event_received_returns_clear_error():

@@ -65,21 +65,22 @@ classic subprocess pipe-deadlock (child blocks writing to a full stderr pipe
 while we block waiting for stdout EOF that never comes), the exact failure
 class `subprocess.run(capture_output=True)` avoided for free internally. Only
 tested on Unix (`select()` doesn't support pipes on Windows) - fine for this
-repo's Darwin dev environment, not verified elsewhere. The 300s timeout is
-enforced via a wall-clock deadline checked every loop iteration, not
-`subprocess.run`'s own `timeout=` kwarg, since Popen has no equivalent for an
-incrementally-read stream.
+repo's Darwin dev environment, not verified elsewhere. There is no default
+wall-clock deadline (see `_resolve_timeout_s()` / `LLM_CHAT_TIMEOUT_S`) -
+`select.select()`'s own `timeout=` kwarg is passed `None` and blocks
+indefinitely unless a caller opts into a ceiling via the env var; not
+`subprocess.run`'s `timeout=` kwarg either way, since Popen has no
+equivalent for an incrementally-read stream.
 """
 
 import json
+import os
 import select
 import subprocess
 import time
 from collections.abc import Callable
 
 from llm_task_router.schema import ProviderResult
-
-TIMEOUT_S = 300
 
 
 def login() -> int:
@@ -119,6 +120,32 @@ def check_auth() -> tuple[bool, str]:
 # Session ids that have already had their establishing (--session-id) call
 # made in this process - see module docstring's "Session continuity" section.
 _established_sessions: set[str] = set()
+
+
+def _resolve_timeout_s() -> int | None:
+    """Recomputed per call, not cached at import - same reasoning as
+    tui.ansi_enabled(): a running session should be able to change this via
+    env var without a restart. No default ceiling at all (returns None,
+    meaning `_drain()` blocks indefinitely) - this went through two fixed
+    defaults (60s, then 300s) that both turned out to be arbitrary guesses a
+    real session blew past: a genuine multi-file tool-use turn got killed
+    mid-task with the whole result discarded, and separately, real sessions
+    here have run past 30 minutes on legitimate work (e.g. driving a full
+    test sweep). `llm-chat` is an interactive terminal client - the user is
+    physically present and Ctrl-C (which interrupts a blocking
+    `select.select()` call directly, no cooperation needed from this
+    function) is already the real way to bail out of a stuck call, making an
+    internal wall-clock guess redundant at best and actively harmful when it
+    fires on a call that was simply still working. LLM_CHAT_TIMEOUT_S is an
+    opt-in ceiling for callers that do want one - e.g. a non-interactive
+    script with nobody watching to press Ctrl-C."""
+    raw = os.environ.get("LLM_CHAT_TIMEOUT_S")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
 
 
 def invoke(
@@ -165,13 +192,16 @@ def invoke(
     if session_id:
         cmd += ["--resume", session_id] if resuming else ["--session-id", session_id]
 
+    timeout_s = _resolve_timeout_s()
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
-    result_event, stderr_text, timed_out = _drain(proc, on_event)
+    result_event, stderr_text, timed_out = _drain(proc, on_event, timeout_s)
 
     if timed_out:
         proc.kill()
         proc.wait()
-        return ProviderResult(text="", cost_usd=0.0, duration_ms=TIMEOUT_S * 1000, error="timeout")
+        return ProviderResult(
+            text="", cost_usd=0.0, duration_ms=(timeout_s or 0) * 1000, error="timeout"
+        )
 
     proc.wait()
     if proc.returncode != 0 and result_event is None:
@@ -200,21 +230,30 @@ def invoke(
     )
 
 
-def _drain(proc: subprocess.Popen, on_event: Callable[[dict], None] | None) -> tuple[dict | None, str, bool]:
+def _drain(
+    proc: subprocess.Popen, on_event: Callable[[dict], None] | None, timeout_s: int | None
+) -> tuple[dict | None, str, bool]:
     """Reads stdout (NDJSON events) and stderr concurrently via select() so
     neither pipe's OS buffer can fill and deadlock the child - see module
     docstring. Returns (result_event, stderr_text, timed_out); result_event
     is the parsed `{"type": "result", ...}` line if one arrived before EOF/
-    timeout, else None."""
-    deadline = time.monotonic() + TIMEOUT_S
+    timeout, else None.
+
+    timeout_s=None (the default, see _resolve_timeout_s()) means no deadline
+    at all: `remaining` stays None and is passed straight through to
+    select.select()'s own timeout arg, which blocks indefinitely - fine here
+    since Ctrl-C still interrupts a blocking select() call directly."""
+    deadline = time.monotonic() + timeout_s if timeout_s is not None else None
     open_streams = {proc.stdout, proc.stderr}
     result_event = None
     stderr_chunks: list[str] = []
 
     while open_streams:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return result_event, "".join(stderr_chunks), True
+        remaining = None
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return result_event, "".join(stderr_chunks), True
 
         ready, _, _ = select.select(list(open_streams), [], [], remaining)
         for stream in ready:
