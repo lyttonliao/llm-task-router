@@ -473,3 +473,62 @@ def test_streaming_text_wraps_complete_lines_at_terminal_width(monkeypatch):
     wrapped_lines = [l for l in lines if "This" in l or "is a" in l or "very" in l or "long" in l]
     # At least one of the wrapped lines should be in the output
     assert len(wrapped_lines) > 0
+
+
+def test_streaming_text_wraps_with_no_newline_across_many_small_deltas(monkeypatch):
+    """Regression test: a real streamed response commonly never contains an
+    internal newline until the very end, or at all (one flowing paragraph),
+    and arrives as small multi-character chunks rather than complete lines.
+    Buffering until a full line accumulates (the prior implementation)
+    printed nothing until a newline showed up and never wrapped the final
+    partial line at all - this exercises exactly that shape."""
+    import os
+    import shutil
+
+    monkeypatch.setenv("NO_COLOR", "1")  # length assertions need visible width, not ANSI byte count
+    monkeypatch.setattr(shutil, "get_terminal_size", lambda fallback: os.terminal_size((30, 24)))
+
+    chunks, write = _writer()
+    renderer = tui.StreamRenderer(write_fn=write)
+
+    text = "This is a very long line that exceeds terminal width and never contains a newline character"
+    renderer.handle({"type": "stream_event", "event": {"type": "content_block_start", "content_block": {"type": "text"}}})
+    for i in range(0, len(text), 4):
+        renderer.handle(
+            {
+                "type": "stream_event",
+                "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": text[i : i + 4]}},
+            }
+        )
+    renderer.finish()
+
+    joined = "".join(chunks)
+    assert "".join(joined.split()) == tui.BULLET + "".join(text.split())
+    for line in joined.rstrip("\n").split("\n"):
+        assert len(line) <= 30, f"line exceeds terminal width: '{line}' ({len(line)} chars)"
+    assert len(joined.rstrip("\n").split("\n")) > 1
+
+
+def test_streaming_wrap_accounts_for_bullet_prefix_width(monkeypatch):
+    """The leading bullet ("⏺ ") is written directly, outside of the
+    word-commit path that tracks column position - column tracking must
+    still count it, or the first line of every text segment silently
+    overflows the terminal width by the bullet's width."""
+    import os
+    import shutil
+
+    monkeypatch.setenv("NO_COLOR", "1")  # length assertions need visible width, not ANSI byte count
+    monkeypatch.setattr(shutil, "get_terminal_size", lambda fallback: os.terminal_size((10, 24)))
+
+    chunks, write = _writer()
+    renderer = tui.StreamRenderer(write_fn=write)
+
+    renderer.handle({"type": "stream_event", "event": {"type": "content_block_start", "content_block": {"type": "text"}}})
+    renderer.handle(
+        {"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "abcdefgh"}}}
+    )
+    renderer.finish()
+
+    joined = "".join(chunks)
+    first_line = joined.split("\n")[0]
+    assert len(first_line) <= 10, f"first line exceeds terminal width: '{first_line}' ({len(first_line)} chars)"

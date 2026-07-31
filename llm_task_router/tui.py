@@ -273,7 +273,9 @@ class StreamRenderer:
         self._text_ever_started = False
         self._any_output = False
         self._in_text_block = False
-        self._line_buffer = ""  # Current line being built (no newline yet)
+        self._word_buffer = ""  # word chars not yet followed by a space/newline
+        self._pending_space = False  # a single space owed before the next word
+        self._column = 0  # cursor column on the current visual output line
         self._terminal_width = get_terminal_width()
 
     def start(self) -> None:
@@ -342,29 +344,46 @@ class StreamRenderer:
         self._buffer_text(delta.get("text", ""))
 
     def _buffer_text(self, text: str) -> None:
-        """Buffer text and output complete lines wrapped at terminal width.
-        Partial lines are kept in buffer for real-time output on finish()."""
-        if not text:
-            return
-
-        self._line_buffer += text
-
-        # Process complete lines (those ending with \n)
-        while "\n" in self._line_buffer:
-            line, self._line_buffer = self._line_buffer.split("\n", 1)
-            # Wrap if line exceeds terminal width
-            if len(line) > self._terminal_width:
-                wrapped = wrap_text(line, self._terminal_width)
+        """Wraps at word boundaries as text streams in, tracking the current
+        on-screen column rather than buffering until a full line accumulates.
+        Deltas are arbitrary-sized chunks off the wire and can split a word
+        or a run of whitespace across calls, and the common case is a
+        response with no internal newline until the very end (or none at
+        all) - buffering full lines (the prior approach) meant nothing
+        printed until a newline showed up, silently breaking live
+        token-by-token streaming, and the final partial line never got
+        wrapped at all."""
+        for ch in text:
+            if ch == "\n":
+                self._commit_word()
+                self._write("\n")
+                self._column = 0
+                self._pending_space = False
+            elif ch.isspace():
+                if self._word_buffer:
+                    self._commit_word()
+                self._pending_space = True
             else:
-                wrapped = line
-            self._write(wrapped)
-            self._write("\n")
+                self._word_buffer += ch
 
-    def _flush_remaining_text(self) -> None:
-        """On finish, output any remaining partial line (without wrapping)."""
-        if self._line_buffer:
-            self._write(self._line_buffer)
-            self._line_buffer = ""
+    def _commit_word(self) -> None:
+        """Writes the buffered word, inserting a wrap (instead of the space
+        that would otherwise separate it from the previous word) if it
+        wouldn't fit in the remaining terminal width."""
+        word = self._word_buffer
+        self._word_buffer = ""
+        if not word:
+            return
+        needed = len(word) + (1 if self._pending_space else 0)
+        if self._column > 0 and self._column + needed > self._terminal_width:
+            self._write("\n")
+            self._column = 0
+        elif self._pending_space:
+            self._write(" ")
+            self._column += 1
+        self._write(word)
+        self._column += len(word)
+        self._pending_space = False
 
     def _start_text_segment(self) -> None:
         """Shared by an explicit `text` content_block_start and the
@@ -373,6 +392,11 @@ class StreamRenderer:
         self._clear_status()
         self._separate()
         self._write(text_bullet())
+        # text_bullet() is BULLET + a trailing space, with zero-width ANSI
+        # color codes around it - column tracking for wrapping needs the
+        # visible width, not len(text_bullet()) which would count the
+        # escape-code bytes too.
+        self._column = len(BULLET) + 1
         self._any_output = True
         self._text_ever_started = True
         self._in_text_block = True
@@ -383,6 +407,7 @@ class StreamRenderer:
         block's own deltas. No-op before the first segment of a turn."""
         if self._any_output:
             self._write("\n\n")
+            self._column = 0
 
     def _clear_status(self) -> None:
         if self._status_shown:
@@ -390,7 +415,7 @@ class StreamRenderer:
             self._status_shown = False
 
     def finish(self) -> None:
-        self._flush_remaining_text()
+        self._commit_word()
         self._clear_status()
         if self._any_output:
             self._write("\n")

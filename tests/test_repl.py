@@ -171,6 +171,21 @@ def test_format_response_success_includes_model_indicator_and_verbatim_text_and_
     assert "345ms" in out
 
 
+def test_format_response_wraps_long_text_at_terminal_width(monkeypatch):
+    import os
+    import shutil
+
+    monkeypatch.setattr(shutil, "get_terminal_size", lambda fallback: os.terminal_size((20, 24)))
+    decision = RouteDecision(tier="cheap", provider="claude", model="haiku", reason="r")
+    result = ProviderResult(text="this response text is long enough to need wrapping", cost_usd=0.0012, duration_ms=345)
+
+    out = format_response(decision, result)
+
+    body_lines = out.split("\n")[1:-1]  # strip header line and cost-footer line
+    for line in body_lines:
+        assert len(line) <= 20, f"line exceeds terminal width: '{line}' ({len(line)} chars)"
+
+
 def test_format_response_error_path_omits_text_and_cost_shows_error():
     """Not an exact-equality check anymore: format_response wraps the header
     and error text in ANSI color codes (see tui.py) as of the 2026-07-27

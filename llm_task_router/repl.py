@@ -144,7 +144,8 @@ def format_response(decision, result) -> str:
     header = tui.header(decision)
     if result.error:
         return f"{header} {tui.error_line(result.error)}"
-    return f"{header}\n{result.text}\n{tui.footer(result)}"
+    wrapped = tui.wrap_text(result.text, tui.get_terminal_width())
+    return f"{header}\n{wrapped}\n{tui.footer(result)}"
 
 
 def _run_plan_turn(
