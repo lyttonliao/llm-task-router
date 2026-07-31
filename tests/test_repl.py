@@ -243,48 +243,40 @@ def test_chat_loop_routes_plain_message_and_spawns_a_terminal():
     assert request.domain is None
     assert uuid.UUID(request.session_id)  # a real UUID string, not raising
 
-    mock_spawn.assert_called_once()
-    args, kwargs = mock_spawn.call_args
-    assert args == ("claude", "haiku", request.session_id, "fix the bug")
-    assert kwargs == {"resume": False}
+    mock_spawn.assert_called_once_with("claude", "haiku", request.session_id, "fix the bug")
 
 
-def test_chat_loop_reuses_same_session_id_across_messages():
-    """session_id is generated once per chat_loop() run, not per message -
-    the whole point of threading it through is that conversation history
-    continues even as different messages route to different tiers. No
-    /clear exists anymore to reset it mid-run."""
+def test_chat_loop_returns_after_first_successful_spawn_without_reading_more_input():
+    """One spawn per chat_loop() run (2026-07-31, revised after live use of
+    the earlier per-message-spawn design showed real friction - one native
+    terminal window per message, requiring a full exit/return cycle for
+    every follow-up). Once a message successfully spawns a terminal,
+    chat_loop() must return immediately rather than prompting for another
+    message - everything after that happens inside the spawned terminal
+    itself, not back at this prompt."""
     decision = RouteDecision(tier="cheap", provider="claude", model="haiku", reason="r")
-
-    with (
-        patch("llm_task_router.repl.route", return_value=decision) as mock_route,
-        patch("llm_task_router.repl.terminal.spawn_provider_session"),
-    ):
-        chat_loop(input_fn=Mock(side_effect=["first", "second", "/exit"]), print_fn=lambda *a: None)
-
-    assert mock_route.call_count == 2
-    (request_1,), _ = mock_route.call_args_list[0]
-    (request_2,), _ = mock_route.call_args_list[1]
-    assert uuid.UUID(request_1.session_id)
-    assert request_1.session_id == request_2.session_id
-
-
-def test_chat_loop_resume_flag_toggles_after_first_successful_spawn():
-    """The first message must establish the session (resume=False); every
-    message after must resume it (resume=True) - mirrors claude_cli.py's
-    --session-id-first-call/--resume-after distinction, tracked locally
-    since chat_loop has exactly one session_id per run now."""
-    decision = RouteDecision(tier="cheap", provider="claude", model="haiku", reason="r")
+    input_fn = Mock(side_effect=["first", AssertionError("input should not be read again")])
 
     with (
         patch("llm_task_router.repl.route", return_value=decision),
-        patch("llm_task_router.repl.terminal.spawn_provider_session") as mock_spawn,
+        patch("llm_task_router.repl.terminal.spawn_provider_session"),
     ):
-        chat_loop(input_fn=Mock(side_effect=["first", "second", "/exit"]), print_fn=lambda *a: None)
+        chat_loop(input_fn=input_fn, print_fn=lambda *a: None)
 
-    assert mock_spawn.call_count == 2
-    assert mock_spawn.call_args_list[0].kwargs["resume"] is False
-    assert mock_spawn.call_args_list[1].kwargs["resume"] is True
+    assert input_fn.call_count == 1
+
+
+def test_chat_loop_prints_session_ended_message_after_successful_spawn():
+    decision = RouteDecision(tier="cheap", provider="claude", model="haiku", reason="r")
+    print_fn = Mock()
+
+    with (
+        patch("llm_task_router.repl.route", return_value=decision),
+        patch("llm_task_router.repl.terminal.spawn_provider_session"),
+    ):
+        chat_loop(input_fn=Mock(side_effect=["first"]), print_fn=print_fn)
+
+    assert any("session ended" in str(call) for call in print_fn.call_args_list)
 
 
 def test_chat_loop_prints_header_before_spawning():
@@ -330,10 +322,9 @@ def test_chat_loop_survives_unexpected_exception_from_route():
 
 
 def test_chat_loop_survives_exception_from_spawn_provider_session():
-    """A spawn failure must not crash the loop, and since the terminal
-    never actually opened, the next message must still try to establish
-    the session (resume=False) rather than resuming one that never
-    started."""
+    """A spawn failure must not crash the loop - since no terminal ever
+    opened, the loop must retry with the same session_id (there's only
+    ever one per run) rather than giving up."""
     decision = RouteDecision(tier="cheap", provider="claude", model="haiku", reason="r")
     print_fn = Mock()
 
@@ -347,26 +338,27 @@ def test_chat_loop_survives_exception_from_spawn_provider_session():
         chat_loop(input_fn=Mock(side_effect=["first", "second", "/exit"]), print_fn=print_fn)
 
     assert mock_spawn.call_count == 2
-    assert mock_spawn.call_args_list[0].kwargs["resume"] is False
-    assert mock_spawn.call_args_list[1].kwargs["resume"] is False
+    session_id_1 = mock_spawn.call_args_list[0].args[2]
+    session_id_2 = mock_spawn.call_args_list[1].args[2]
+    assert session_id_1 == session_id_2
     assert any("no terminal emulator found" in str(call) for call in print_fn.call_args_list)
 
 
-def test_chat_loop_prints_divider_between_turns_but_not_before_first_prompt():
+def test_chat_loop_prints_divider_between_retries_but_not_before_first_prompt():
+    """Dividers separate re-prompts on paths that never spawned a terminal
+    (here: two unknown commands in a row before /exit) - there's no
+    "between successful turns" case anymore since a successful spawn ends
+    the loop immediately."""
     from llm_task_router import tui
 
-    decision = RouteDecision(tier="cheap", provider="claude", model="haiku", reason="r")
-
     print_fn = Mock()
-    with (
-        patch("llm_task_router.repl.route", return_value=decision),
-        patch("llm_task_router.repl.terminal.spawn_provider_session"),
-    ):
-        chat_loop(input_fn=Mock(side_effect=["first", "second", "/exit"]), print_fn=print_fn)
+    with patch("llm_task_router.repl.route") as mock_route:
+        chat_loop(input_fn=Mock(side_effect=["/bogus", "/also-bogus", "/exit"]), print_fn=print_fn)
 
+    mock_route.assert_not_called()
     divider_calls = [c for c in print_fn.call_args_list if c.args and tui.DIVIDER_CHAR in str(c.args[0])]
-    # three prompts total (first, second, the /exit attempt) -> a divider
-    # before every one of them except the very first
+    # three prompts total (/bogus, /also-bogus, /exit) -> a divider before
+    # every one of them except the very first
     assert len(divider_calls) == 2
 
 
