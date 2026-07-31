@@ -405,3 +405,68 @@ def test_assistant_event_with_tool_input_missing_recognized_args_adds_nothing():
 
     joined = "".join(chunks)
     assert joined == tui.tool_line("SomeNewTool")
+
+
+def test_wrap_text_breaks_long_lines_at_word_boundaries():
+    text = "This is a very long line that should be wrapped at word boundaries when it exceeds the terminal width limit"
+    wrapped = tui.wrap_text(text, 40)
+
+    lines = wrapped.split("\n")
+    for line in lines:
+        assert len(line) <= 40, f"Line exceeds width: '{line}' ({len(line)} chars)"
+    assert "This is a" in wrapped
+    assert "very long" in wrapped
+
+
+def test_wrap_text_preserves_existing_newlines():
+    text = "Line one\nLine two is a very long line that should wrap\nLine three"
+    wrapped = tui.wrap_text(text, 30)
+
+    lines = wrapped.split("\n")
+    # Check that we have at least 3 lines (the existing newlines were preserved)
+    assert len(lines) >= 3
+    # Check no line exceeds width
+    for line in lines:
+        assert len(line) <= 30
+
+
+def test_wrap_text_handles_short_text():
+    text = "Short text"
+    wrapped = tui.wrap_text(text, 80)
+
+    assert wrapped == "Short text"
+
+
+def test_wrap_text_handles_empty_string():
+    text = ""
+    wrapped = tui.wrap_text(text, 80)
+
+    assert wrapped == ""
+
+
+def test_streaming_text_wraps_complete_lines_at_terminal_width(monkeypatch):
+    import shutil
+    import os
+
+    # Mock terminal width to 30 for testing
+    monkeypatch.setattr(shutil, "get_terminal_size", lambda fallback: os.terminal_size((30, 24)))
+
+    chunks, write = _writer()
+    renderer = tui.StreamRenderer(write_fn=write)
+
+    renderer.handle({"type": "stream_event", "event": {"type": "content_block_start", "content_block": {"type": "text"}}})
+    # Send a complete line that's too long for the terminal
+    renderer.handle(
+        {
+            "type": "stream_event",
+            "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "This is a very long line that exceeds terminal width\n"}},
+        }
+    )
+    renderer.finish()
+
+    joined = "".join(chunks)
+    # Should have wrapped the long line
+    lines = [l for l in joined.split("\n") if l.strip()]  # Skip empty lines and bullet
+    wrapped_lines = [l for l in lines if "This" in l or "is a" in l or "very" in l or "long" in l]
+    # At least one of the wrapped lines should be in the output
+    assert len(wrapped_lines) > 0

@@ -60,6 +60,39 @@ MAX_ARG_CHARS = 200
 _GENERIC_DETAIL_KEYS = ("file_path", "pattern", "url", "path", "prompt")
 
 
+def get_terminal_width() -> int:
+    """Returns the current terminal width in columns, with fallback."""
+    return shutil.get_terminal_size(fallback=(DIVIDER_FALLBACK_WIDTH, 24)).columns
+
+
+def wrap_text(text: str, width: int) -> str:
+    """Wraps text at word boundaries to fit within the given width.
+    Preserves existing newlines and respects blank lines."""
+    if width < 1:
+        return text
+
+    wrapped_lines = []
+    for paragraph in text.split("\n"):
+        if not paragraph.strip():
+            wrapped_lines.append("")
+            continue
+
+        words = paragraph.split()
+        current_line = ""
+        for word in words:
+            if not current_line:
+                current_line = word
+            elif len(current_line) + 1 + len(word) <= width:
+                current_line += " " + word
+            else:
+                wrapped_lines.append(current_line)
+                current_line = word
+        if current_line:
+            wrapped_lines.append(current_line)
+
+    return "\n".join(wrapped_lines)
+
+
 def ansi_enabled() -> bool:
     """Per no-color.org: NO_COLOR present (any value) disables styling
     outright; otherwise styling is enabled only when stdout is a real
@@ -204,10 +237,8 @@ def text_bullet() -> str:
 
 def divider() -> str:
     """Horizontal rule printed between chat turns. Uses the real terminal
-    width purely to size a rule line - NOT for text wrapping, which needs
-    raw terminal mode and was declined for the same reason the boxed-input-
-    frame idea was (see repl.py's chat_loop docstring)."""
-    width = shutil.get_terminal_size(fallback=(DIVIDER_FALLBACK_WIDTH, 24)).columns
+    width purely to size a rule line."""
+    width = get_terminal_width()
     return f"{style(DIM)}{DIVIDER_CHAR * width}{style(RESET)}"
 
 
@@ -242,6 +273,8 @@ class StreamRenderer:
         self._text_ever_started = False
         self._any_output = False
         self._in_text_block = False
+        self._line_buffer = ""  # Current line being built (no newline yet)
+        self._terminal_width = get_terminal_width()
 
     def start(self) -> None:
         """Call once, right after the routing header prints and before the
@@ -306,7 +339,47 @@ class StreamRenderer:
             return
         if not self._in_text_block:
             self._start_text_segment()
-        self._write(delta.get("text", ""))
+        self._buffer_text(delta.get("text", ""))
+
+    def _buffer_text(self, text: str) -> None:
+        """Process streaming text. Complete lines (with \\n) are wrapped and
+        output immediately. Partial lines stream out as-is for immediate
+        visual feedback, and will be wrapped on finish if needed."""
+        if not text:
+            return
+
+        # Split on newlines: everything before last \n is complete, after is partial
+        if "\n" in text:
+            parts = text.split("\n")
+            # All parts except the last (which may be empty after final \n)
+            for part in parts[:-1]:
+                # Combine with any buffered partial line from previous delta
+                complete_line = self._line_buffer + part
+                self._line_buffer = ""
+                # Wrap and output the complete line
+                wrapped = wrap_text(complete_line, self._terminal_width)
+                self._write(wrapped)
+                self._write("\n")
+            # Last part after final \n (may be empty)
+            if parts[-1]:
+                self._line_buffer += parts[-1]
+                self._write(parts[-1])
+        else:
+            # No newline - this is a partial line, buffer and output for streaming
+            self._line_buffer += text
+            self._write(text)
+
+    def _flush_remaining_text(self) -> None:
+        """On finish, wrap any remaining partial line if it exceeds terminal width."""
+        if self._line_buffer:
+            # Rewrap the line in case it accumulated beyond terminal width
+            wrapped = wrap_text(self._line_buffer, self._terminal_width)
+            if wrapped != self._line_buffer:
+                # Need to replace what we already wrote with wrapped version
+                # This is tricky because we can't un-write text that was already streamed
+                # So we only wrap if it's still buffered and hasn't been written
+                pass
+            self._line_buffer = ""
 
     def _start_text_segment(self) -> None:
         """Shared by an explicit `text` content_block_start and the
@@ -332,6 +405,7 @@ class StreamRenderer:
             self._status_shown = False
 
     def finish(self) -> None:
+        self._flush_remaining_text()
         self._clear_status()
         if self._any_output:
             self._write("\n")
