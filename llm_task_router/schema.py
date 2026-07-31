@@ -37,6 +37,12 @@ class RouteDecision:
     provider: str
     model: str
     reason: str
+    # id of the row decision_log.log_decision() wrote for this decision, or
+    # None if logging was unavailable/failed (see router.route()) - lets
+    # route_and_run() attach the real ProviderResult's cost/duration back
+    # onto that same row via decision_log.log_result() once the provider
+    # call completes. Not meaningful outside router.py/decision_log.py.
+    decision_log_id: int | None = None
 
 
 @dataclass

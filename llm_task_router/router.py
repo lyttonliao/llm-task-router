@@ -343,8 +343,9 @@ def route(request: TaskRequest) -> RouteDecision:
     if tier2_task_type_resolution is not None:
         logged_task_type_source = f"tier2_{tier2_task_type_resolution.source}"
 
+    decision_log_id = None
     try:
-        decision_log.log_decision(
+        decision_log_id = decision_log.log_decision(
             request.description,
             embedding,
             resolved_task_type=resolved_task_type,
@@ -366,7 +367,9 @@ def route(request: TaskRequest) -> RouteDecision:
     except Exception:
         pass  # a logging failure must never break routing - see decision_log.py's module docstring
 
-    return RouteDecision(tier=tier, provider=provider, model=model, reason=reason)
+    return RouteDecision(
+        tier=tier, provider=provider, model=model, reason=reason, decision_log_id=decision_log_id
+    )
 
 
 def route_and_run(
@@ -380,7 +383,16 @@ def route_and_run(
     print "routed to X" immediately instead of only after the full response
     lands. on_event is forwarded straight into provider.invoke() for
     per-event streaming (see claude_cli.py); providers that can't stream yet
-    (codex_cli.py) accept and ignore it."""
+    (codex_cli.py) accept and ignore it.
+
+    Once the provider call completes, the real cost/duration are written
+    back onto the row route() already logged (decision.decision_log_id) via
+    decision_log.log_result() - log_decision() alone can't know these yet,
+    since it runs before the provider is ever invoked. Same
+    never-let-logging-break-the-real-call discipline as route()'s own
+    logging: wrapped in try/except, and skipped entirely when
+    decision_log_id is None (logging was unavailable/failed, or this
+    request never reaches a provider call in some other caller)."""
     decision = route(request)
     if on_decision:
         on_decision(decision)
@@ -391,4 +403,9 @@ def route_and_run(
         session_id=request.session_id,
         on_event=on_event,
     )
+    if decision.decision_log_id is not None:
+        try:
+            decision_log.log_result(decision.decision_log_id, result.cost_usd, result.duration_ms)
+        except Exception:
+            pass  # a logging failure must never break the already-completed call
     return decision, result

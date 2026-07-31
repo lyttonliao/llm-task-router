@@ -9,15 +9,16 @@ from unittest.mock import patch
 import pytest
 from pgvector import Vector
 
-from llm_task_router.decision_log import LoggedDecision, fetch_decisions, log_decision
+from llm_task_router.decision_log import LoggedDecision, fetch_decisions, log_decision, log_result
 
 _DATABASE_URL = "postgresql://test:test@localhost/test"
 
 
 class _FakeCursor:
-    def __init__(self, fetchall_result=None):
+    def __init__(self, fetchall_result=None, fetchone_result=(1,)):
         self.executed = []
         self._fetchall_result = fetchall_result or []
+        self._fetchone_result = fetchone_result
 
     def execute(self, query, params=None):
         self.executed.append((query, params))
@@ -25,6 +26,9 @@ class _FakeCursor:
 
     def fetchall(self):
         return self._fetchall_result
+
+    def fetchone(self):
+        return self._fetchone_result
 
     def __enter__(self):
         return self
@@ -52,7 +56,7 @@ def _patched_env():
 
 
 def test_log_decision_inserts_expected_row_with_embedding():
-    fake_cursor = _FakeCursor()
+    fake_cursor = _FakeCursor(fetchone_result=(42,))
     fake_conn = _FakeConnection(fake_cursor)
     with (
         _patched_env(),
@@ -61,7 +65,7 @@ def test_log_decision_inserts_expected_row_with_embedding():
         ) as mock_connect,
         patch("llm_task_router.decision_log.register_vector") as mock_register,
     ):
-        log_decision(
+        returned_id = log_decision(
             "write a function that validates emails",
             [0.1, 0.2, 0.3],
             resolved_task_type="code_gen",
@@ -83,9 +87,11 @@ def test_log_decision_inserts_expected_row_with_embedding():
 
     mock_connect.assert_called_once_with(_DATABASE_URL)
     mock_register.assert_called_once_with(fake_conn)
+    assert returned_id == 42
     assert len(fake_cursor.executed) == 1
     query, params = fake_cursor.executed[0]
     assert "INSERT INTO routing_decisions" in query
+    assert "RETURNING id" in query
     (
         description,
         embedding_param,
@@ -227,6 +233,43 @@ def test_database_url_missing_raises_runtime_error():
     mock_connect.assert_not_called()
 
 
+# --- log_result --------------------------------------------------------------
+
+
+def test_log_result_updates_cost_and_duration_by_id():
+    fake_cursor = _FakeCursor()
+    fake_conn = _FakeConnection(fake_cursor)
+    with (
+        _patched_env(),
+        patch(
+            "llm_task_router.decision_log.psycopg.connect", return_value=fake_conn
+        ) as mock_connect,
+        patch("llm_task_router.decision_log.register_vector") as mock_register,
+    ):
+        log_result(42, 1.483, 147574)
+
+    mock_connect.assert_called_once_with(_DATABASE_URL)
+    mock_register.assert_called_once_with(fake_conn)
+    assert len(fake_cursor.executed) == 1
+    query, params = fake_cursor.executed[0]
+    assert "UPDATE routing_decisions" in query
+    assert "SET cost_usd" in query
+    assert "duration_ms" in query
+    assert params == (1.483, 147574, 42)
+
+
+def test_log_result_database_url_missing_raises_runtime_error():
+    env_without_url = {k: v for k, v in os.environ.items() if k != "DATABASE_URL"}
+    with (
+        patch.dict(os.environ, env_without_url, clear=True),
+        patch("llm_task_router.decision_log.psycopg.connect") as mock_connect,
+    ):
+        with pytest.raises(RuntimeError, match="DATABASE_URL"):
+            log_result(42, 1.483, 147574)
+
+    mock_connect.assert_not_called()
+
+
 # --- fetch_decisions --------------------------------------------------------
 
 
@@ -248,6 +291,8 @@ def test_fetch_decisions_returns_logged_decision_rows_in_order():
         "L",
         "cheap",
         "shadow (no tier 2): heuristic grid code_gen x None -> L",
+        0.0042,
+        1234,
     )
     fake_cursor = _FakeCursor(fetchall_result=[row])
     fake_conn = _FakeConnection(fake_cursor)
@@ -263,6 +308,8 @@ def test_fetch_decisions_returns_logged_decision_rows_in_order():
     mock_connect.assert_called_once_with(_DATABASE_URL)
     query, _params = fake_cursor.executed[0]
     assert "SELECT" in query
+    assert "cost_usd" in query
+    assert "duration_ms" in query
     assert "FROM routing_decisions" in query
     assert "ORDER BY created_at ASC" in query
     assert decisions == [
@@ -283,6 +330,8 @@ def test_fetch_decisions_returns_logged_decision_rows_in_order():
             shadow_bias="L",
             shadow_tier="cheap",
             shadow_reason="shadow (no tier 2): heuristic grid code_gen x None -> L",
+            cost_usd=0.0042,
+            duration_ms=1234,
         )
     ]
 

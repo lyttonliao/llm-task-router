@@ -56,6 +56,8 @@ class LoggedDecision(NamedTuple):
     shadow_bias: str
     shadow_tier: str
     shadow_reason: str
+    cost_usd: float | None
+    duration_ms: int | None
 
 
 def _database_url() -> str:
@@ -90,19 +92,24 @@ def log_decision(
     shadow_bias: str,
     shadow_tier: str,
     shadow_reason: str,
-) -> None:
-    """Inserts one row into routing_decisions. `embedding` is None whenever
-    the heuristic grid resolved the request without ever calling
-    `embeddings.embed()` - a pure-heuristic decision has no embedding to
-    log, and forcing one into existence just for this row would mean paying
-    for an embedding call this request never otherwise needed.
+) -> int:
+    """Inserts one row into routing_decisions and returns its id. `embedding`
+    is None whenever the heuristic grid resolved the request without ever
+    calling `embeddings.embed()` - a pure-heuristic decision has no
+    embedding to log, and forcing one into existence just for this row would
+    mean paying for an embedding call this request never otherwise needed.
 
     `shadow_bias`/`shadow_tier`/`shadow_reason` are what tier 1 alone (no
     tier 2 consulted) would have decided for this same request - see
     router.py's `_shadow_tier1_only_decision()`. Purely descriptive: this
     row's `bias`/`tier`/`provider`/`model` are still what actually served
     the request. `report_shadow_divergence.py` reads these back to
-    measure how often, and in which direction, tier 2 changes the outcome."""
+    measure how often, and in which direction, tier 2 changes the outcome.
+
+    Called from `route()`, before the provider is ever invoked (so a
+    dry-run still gets audited) - the returned id is what `route_and_run()`
+    later passes to `log_result()` to attach the real cost/duration once the
+    provider call actually completes."""
     query = """
         INSERT INTO routing_decisions (
             description, embedding, resolved_task_type, task_type_source,
@@ -111,6 +118,7 @@ def log_decision(
             shadow_bias, shadow_tier, shadow_reason
         )
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING id
     """
     vector = Vector(embedding) if embedding is not None else None
     with _connect() as conn, conn.cursor() as cur:
@@ -136,6 +144,19 @@ def log_decision(
                 shadow_reason,
             ),
         )
+        return cur.fetchone()[0]
+
+
+def log_result(decision_id: int, cost_usd: float, duration_ms: int) -> None:
+    """Attaches the real ProviderResult's cost/duration to the row
+    log_decision() already created for this same route() call - see
+    router.route_and_run(). A separate UPDATE rather than folding this into
+    log_decision() itself, because log_decision() runs before the provider
+    is invoked (route() alone, with no provider call, is a valid use - see
+    its docstring) - the cost genuinely isn't known yet at insert time."""
+    query = "UPDATE routing_decisions SET cost_usd = %s, duration_ms = %s WHERE id = %s"
+    with _connect() as conn, conn.cursor() as cur:
+        cur.execute(query, (cost_usd, duration_ms, decision_id))
 
 
 def fetch_decisions() -> list[LoggedDecision]:
@@ -149,7 +170,8 @@ def fetch_decisions() -> list[LoggedDecision]:
         SELECT id, description, resolved_task_type, task_type_source,
                domain, domain_source, resolved_is_high_stakes, high_stakes_source,
                bias, tier, provider, model, reason,
-               shadow_bias, shadow_tier, shadow_reason
+               shadow_bias, shadow_tier, shadow_reason,
+               cost_usd, duration_ms
         FROM routing_decisions
         ORDER BY created_at ASC
     """

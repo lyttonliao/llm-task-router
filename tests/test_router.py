@@ -654,6 +654,91 @@ def test_route_logging_failure_never_breaks_routing():
     assert decision.tier == "cheap"
 
 
+def test_route_returns_decision_log_id_from_log_decision(_noop_decision_log):
+    """route() threads log_decision()'s return value straight into
+    RouteDecision.decision_log_id - route_and_run() needs it to attach real
+    cost/duration later via decision_log.log_result()."""
+    _noop_decision_log.return_value = 42
+    request = TaskRequest(
+        description="fix null pointer in login form", task_type="triage", domain="frontend"
+    )
+
+    decision = route(request)
+
+    assert decision.decision_log_id == 42
+
+
+def test_route_decision_log_id_is_none_when_logging_unavailable():
+    request = TaskRequest(
+        description="fix null pointer in login form", task_type="triage", domain="frontend"
+    )
+    with patch(
+        "llm_task_router.router.decision_log.log_decision",
+        side_effect=RuntimeError("DATABASE_URL not set"),
+    ):
+        decision = route(request)
+
+    assert decision.decision_log_id is None
+
+
+def test_route_and_run_writes_cost_and_duration_back_via_log_result(
+    _noop_decision_log, _noop_decision_log_result
+):
+    """Once the real provider call completes, route_and_run() must attach
+    its actual cost/duration to the same row route() already logged - the
+    whole point of decision_log_id existing on RouteDecision."""
+    _noop_decision_log.return_value = 42
+    request = TaskRequest(
+        description="summarize this report", task_type="summarization", domain="other"
+    )
+    fake_result = ProviderResult(text="summary here", cost_usd=1.483, duration_ms=147574)
+
+    with patch("llm_task_router.router.claude_cli.invoke", return_value=fake_result):
+        route_and_run(request)
+
+    _noop_decision_log_result.assert_called_once_with(42, 1.483, 147574)
+
+
+def test_route_and_run_skips_log_result_when_decision_log_id_is_none(
+    _noop_decision_log, _noop_decision_log_result
+):
+    """log_decision()'s default-mocked return is None (see conftest.py) -
+    route_and_run() must not call log_result() with a None id, since there's
+    no row to attach cost to."""
+    request = TaskRequest(
+        description="summarize this report", task_type="summarization", domain="other"
+    )
+    fake_result = ProviderResult(text="summary here", cost_usd=0.001, duration_ms=200)
+
+    with patch("llm_task_router.router.claude_cli.invoke", return_value=fake_result):
+        route_and_run(request)
+
+    _noop_decision_log_result.assert_not_called()
+
+
+def test_route_and_run_log_result_failure_never_breaks_the_call(_noop_decision_log):
+    """Same discipline as route()'s own logging: a real Postgres failure on
+    the write-back must degrade to 'no cost recorded for this call', never
+    break an already-completed, already-paid-for provider response."""
+    _noop_decision_log.return_value = 42
+    request = TaskRequest(
+        description="summarize this report", task_type="summarization", domain="other"
+    )
+    fake_result = ProviderResult(text="summary here", cost_usd=0.001, duration_ms=200)
+
+    with (
+        patch("llm_task_router.router.claude_cli.invoke", return_value=fake_result),
+        patch(
+            "llm_task_router.router.decision_log.log_result",
+            side_effect=RuntimeError("connection lost"),
+        ),
+    ):
+        decision, result = route_and_run(request)
+
+    assert result is fake_result
+    assert decision.decision_log_id == 42
+
+
 def test_route_and_run_invokes_resolved_provider():
     request = TaskRequest(
         description="summarize this report", task_type="summarization", domain="other"

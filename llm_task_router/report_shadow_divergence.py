@@ -19,6 +19,14 @@ more expensively than tier 1 alone would have; de-escalated = the reverse),
 plus which tier2_classifier axis (task_type resolution vs high-stakes
 corroboration) drove each divergence.
 
+Also prints a real cost summary (total and per-tier, see
+_print_cost_summary()) sourced from cost_usd/duration_ms - added 2026-07-31,
+written back onto each row by decision_log.log_result() once the real
+provider call completes (see router.route_and_run()). This is real dollar
+cost for the tier that actually served the request, not a shadow estimate -
+the shadow tier's model was never invoked, so its cost is unknowable, only
+inferable from what the real tier of the same name costs elsewhere.
+
 Requires DATABASE_URL to already be set, same as audit_tier2.py -
 decision_log.py raises RuntimeError on its own the first time it needs a
 connection, so that check isn't duplicated here.
@@ -62,6 +70,34 @@ def _driving_source(decision: LoggedDecision) -> str:
     return "neither (no-signal hedge divergence)"
 
 
+def _print_cost_summary(decisions: list[LoggedDecision]) -> None:
+    """Real dollar cost, not a shadow estimate - decision_log.log_result()
+    only ever attaches cost_usd/duration_ms for the tier that actually
+    served the request (see router.route_and_run()); the shadow tier's cost
+    is inherently unknowable since it was never actually invoked. Rows
+    logged before cost write-back existed (2026-07-31), or where the
+    provider call itself failed before log_result() ever ran, have
+    cost_usd=None - excluded here rather than silently counted as $0."""
+    priced = [d for d in decisions if d.cost_usd is not None]
+    print(f"\nCost data available for {len(priced)}/{len(decisions)} row(s).")
+    if not priced:
+        return
+
+    total = sum(d.cost_usd for d in priced)
+    print(f"  total: ${total:.4f}")
+
+    by_tier: dict[str, list[float]] = {}
+    for d in priced:
+        by_tier.setdefault(d.tier, []).append(d.cost_usd)
+    print("  by real tier:")
+    for tier in sorted(by_tier, key=lambda t: TIER_ORDER.get(t, -1)):
+        costs = by_tier[tier]
+        print(
+            f"    {tier:<10}{len(costs):>4} call(s)   total ${sum(costs):.4f}   "
+            f"avg ${sum(costs) / len(costs):.4f}"
+        )
+
+
 def main() -> None:
     decisions = decision_log.fetch_decisions()
     print(f"{len(decisions)} logged decision(s).")
@@ -91,6 +127,8 @@ def main() -> None:
     print("\nWhich tier2_classifier axis drove the divergence:")
     for source, count in source_counts.most_common():
         print(f"  {source:<28}{count}")
+
+    _print_cost_summary(scored)
 
     print("\nSample divergent rows (up to 10):")
     for d in divergent[:10]:

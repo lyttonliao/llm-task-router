@@ -91,3 +91,36 @@ migration compatibility with rows logged before this existed). An existing
 live database needs the three commented `ALTER TABLE` statements at the
 bottom of that file run manually via `psql` — not applied automatically,
 same one-time/not-idempotent discipline the rest of that file documents.
+
+## Real cost tracking (2026-07-31)
+
+`log_decision()` ran *before* the provider was ever invoked (so a dry-run
+still gets audited), which meant `routing_decisions` had no way to know the
+real dollar cost of the call it led to — `ProviderResult.cost_usd`/
+`duration_ms` were printed to the terminal (`tui.footer()`) and then
+discarded. `routing_decisions` gained `cost_usd`/`duration_ms` columns
+(nullable, same migration-compatibility pattern as `shadow_*` — see the
+commented `ALTER TABLE` block at the bottom of `db/schema.sql`).
+
+`log_decision()` now runs as `INSERT ... RETURNING id` and returns that id;
+`RouteDecision` gained a `decision_log_id: int | None` field carrying it.
+`route_and_run()` — which, unlike `route()` alone, actually invokes the
+provider — calls the new `decision_log.log_result(decision_log_id,
+cost_usd, duration_ms)` (a plain `UPDATE ... WHERE id = ...`) once the real
+`ProviderResult` comes back, wrapped in the same `try/except Exception:
+pass` discipline as the original logging call: a failed write-back degrades
+to "no cost recorded for this call," never breaks an already-completed,
+already-paid-for response. Skipped entirely when `decision_log_id` is
+`None` (logging was unavailable, or a caller only ever called `route()`).
+
+`report_shadow_divergence.py` gained a cost summary (total + per-tier
+average, over whatever subset of logged rows actually has `cost_usd`
+populated — older rows and any row where the write-back never landed are
+excluded, not counted as $0). This is real cost for the tier that *actually*
+served each request — the shadow tier's model is never invoked, so its cost
+is fundamentally unknowable, only inferable by comparing against what the
+real tier of the same name costs elsewhere in the table.
+
+Verified end-to-end against the real local DB: a real `route_and_run()`
+call logged a row, then `UPDATE`d it with real `cost_usd`/`duration_ms`
+moments later, confirmed via `psql`.

@@ -53,6 +53,14 @@ CREATE TABLE routing_decisions (
     shadow_bias TEXT,
     shadow_tier TEXT,
     shadow_reason TEXT,
+    -- Real cost/latency from the provider call this decision actually led
+    -- to (see decision_log.log_result(), called from router.route_and_run()
+    -- once the call completes). Null for any row where route() alone was
+    -- called (a dry-run, or the provider call itself failed before this
+    -- ever got attached) - never fabricated. Nullable for migration
+    -- compatibility with the ALTER TABLE below, same as shadow_* above.
+    cost_usd DOUBLE PRECISION,
+    duration_ms INTEGER,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -64,3 +72,9 @@ CREATE INDEX routing_decisions_created_at ON routing_decisions (created_at);
 -- ALTER TABLE routing_decisions ADD COLUMN shadow_bias TEXT;
 -- ALTER TABLE routing_decisions ADD COLUMN shadow_tier TEXT;
 -- ALTER TABLE routing_decisions ADD COLUMN shadow_reason TEXT;
+
+-- Migration for an existing live routing_decisions table created before
+-- real cost/duration write-back was added (2026-07-31) - run this instead
+-- of the CREATE TABLE above against a database that already has the table.
+-- ALTER TABLE routing_decisions ADD COLUMN cost_usd DOUBLE PRECISION;
+-- ALTER TABLE routing_decisions ADD COLUMN duration_ms INTEGER;
