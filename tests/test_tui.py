@@ -302,3 +302,106 @@ def test_divider_falls_back_to_80_columns_when_size_unavailable(monkeypatch):
     out = tui.divider()
 
     assert out.count(tui.DIVIDER_CHAR) == tui.DIVIDER_FALLBACK_WIDTH
+
+
+def test_tool_detail_edit_shows_file_path_and_diff():
+    out = tui.tool_detail(
+        "Edit", {"file_path": "foo.py", "old_string": "line1\nold\nline3", "new_string": "line1\nnew\nline3"}
+    )
+
+    assert "foo.py" in out
+    assert "-old" in out
+    assert "+new" in out
+
+
+def test_tool_detail_edit_caps_huge_diffs():
+    old = "\n".join(f"old{i}" for i in range(200))
+    new = "\n".join(f"new{i}" for i in range(200))
+
+    out = tui.tool_detail("Edit", {"file_path": "big.py", "old_string": old, "new_string": new})
+
+    assert out.count("\n") < 100
+    assert "more diff lines" in out
+
+
+def test_tool_detail_write_shows_file_path_and_content_preview():
+    out = tui.tool_detail("Write", {"file_path": "new_file.py", "content": "line one\nline two"})
+
+    assert "new_file.py" in out
+    assert "+line one" in out
+    assert "+line two" in out
+
+
+def test_tool_detail_write_caps_huge_content():
+    content = "\n".join(f"line{i}" for i in range(200))
+
+    out = tui.tool_detail("Write", {"file_path": "big.py", "content": content})
+
+    assert out.count("\n") < 30
+    assert "more lines" in out
+
+
+def test_tool_detail_bash_shows_command():
+    out = tui.tool_detail("Bash", {"command": "echo hello"})
+
+    assert "echo hello" in out
+
+
+def test_tool_detail_generic_tool_shows_file_path():
+    out = tui.tool_detail("Read", {"file_path": "some/file.py"})
+
+    assert "some/file.py" in out
+
+
+def test_tool_detail_returns_empty_string_for_tool_with_no_recognized_argument():
+    assert tui.tool_detail("SomeNewTool", {}) == ""
+
+
+def test_assistant_event_with_non_tool_content_is_ignored():
+    chunks, write = _writer()
+    renderer = tui.StreamRenderer(write_fn=write)
+
+    renderer.handle({"type": "assistant", "message": {"content": [{"type": "text", "text": "hi"}]}})
+
+    assert chunks == []
+
+
+def test_assistant_event_appends_tool_detail_after_bullet_without_blank_line_separator():
+    chunks, write = _writer()
+    renderer = tui.StreamRenderer(write_fn=write)
+
+    renderer.handle(
+        {"type": "stream_event", "event": {"type": "content_block_start", "content_block": {"type": "tool_use", "name": "Edit"}}}
+    )
+    renderer.handle(
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "Edit",
+                        "input": {"file_path": "foo.py", "old_string": "a", "new_string": "b"},
+                    }
+                ]
+            },
+        }
+    )
+
+    joined = "".join(chunks)
+    assert "Edit" in joined
+    assert "foo.py" in joined
+    assert "\n\n" not in joined  # same segment as the bullet, not a new one
+
+
+def test_assistant_event_with_tool_input_missing_recognized_args_adds_nothing():
+    chunks, write = _writer()
+    renderer = tui.StreamRenderer(write_fn=write)
+
+    renderer.handle(
+        {"type": "stream_event", "event": {"type": "content_block_start", "content_block": {"type": "tool_use", "name": "SomeNewTool"}}}
+    )
+    renderer.handle({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "SomeNewTool", "input": {}}]}})
+
+    joined = "".join(chunks)
+    assert joined == tui.tool_line("SomeNewTool")

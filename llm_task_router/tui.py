@@ -22,6 +22,7 @@ unlike a fixed 256-color code, stays legible across both light and dark
 terminal themes.
 """
 
+import difflib
 import os
 import shutil
 import sys
@@ -36,6 +37,8 @@ CODEX_COLOR = "\x1b[38;5;36m"  # teal
 TEXT_COLOR = "\x1b[38;5;255m"  # near-white, for Claude's own text/reasoning bullet
 TOOL_COLOR = "\x1b[38;5;34m"  # green, for a running tool call
 ERROR_COLOR = "\x1b[38;5;196m"  # red
+DIFF_ADD_COLOR = "\x1b[38;5;34m"  # green, added diff/content-preview lines
+DIFF_DEL_COLOR = "\x1b[38;5;196m"  # red, removed diff lines
 
 PROVIDER_COLORS = {"claude": CLAUDE_COLOR, "codex": CODEX_COLOR}
 
@@ -43,6 +46,18 @@ BULLET = "⏺"
 THINKING_GLYPH = "*"
 DIVIDER_CHAR = "─"
 DIVIDER_FALLBACK_WIDTH = 80
+
+# Detail rendering (tool_detail()) caps - a long Edit/Write on a big file
+# should still show real progress, but not flood the terminal with hundreds
+# of lines for one tool call.
+MAX_DIFF_LINES = 40
+MAX_CONTENT_PREVIEW_LINES = 20
+MAX_ARG_CHARS = 200
+
+# Tool names (besides Edit/Write, which get dedicated renderers below) whose
+# single most useful argument is worth surfacing verbatim - the primary
+# target/query of the call, in the order checked.
+_GENERIC_DETAIL_KEYS = ("file_path", "pattern", "url", "path", "prompt")
 
 
 def ansi_enabled() -> bool:
@@ -90,6 +105,82 @@ def footer(result) -> str:
 
 def tool_line(name: str) -> str:
     return f"{style(TOOL_COLOR)}{BULLET} {name}{style(RESET)}"
+
+
+def _truncate(text: str, limit: int) -> str:
+    text = text.strip()
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _dim(text: str) -> str:
+    return f"{style(DIM)}{text}{style(RESET)}"
+
+
+def _style_diff_line(line: str) -> str:
+    if line.startswith("+"):
+        return f"{style(DIFF_ADD_COLOR)}{line}{style(RESET)}"
+    if line.startswith("-"):
+        return f"{style(DIFF_DEL_COLOR)}{line}{style(RESET)}"
+    if line.startswith("@@"):
+        return _dim(line)
+    return line
+
+
+def _edit_detail(tool_input: dict) -> str:
+    """A real unified diff of old_string/new_string, not the raw before/
+    after blobs - a small change in a big string should read as a small
+    diff, not two walls of text."""
+    lines = []
+    file_path = tool_input.get("file_path", "")
+    if file_path:
+        lines.append(_dim(file_path))
+
+    old = tool_input.get("old_string", "")
+    new = tool_input.get("new_string", "")
+    # unified_diff's first two lines are the "---"/"+++" file-header lines -
+    # dropped since file_path is already shown above.
+    diff_lines = list(difflib.unified_diff(old.splitlines(), new.splitlines(), lineterm="", n=1))[2:]
+    lines.extend(_style_diff_line(line) for line in diff_lines[:MAX_DIFF_LINES])
+    if len(diff_lines) > MAX_DIFF_LINES:
+        lines.append(_dim(f"… {len(diff_lines) - MAX_DIFF_LINES} more diff lines"))
+
+    return "\n".join(lines)
+
+
+def _write_detail(tool_input: dict) -> str:
+    """A new-file Write has no "before" to diff against - preview the
+    content itself, capped the same way a huge Edit diff is."""
+    lines = []
+    file_path = tool_input.get("file_path", "")
+    if file_path:
+        lines.append(_dim(file_path))
+
+    content_lines = tool_input.get("content", "").splitlines()
+    lines.extend(f"{style(DIFF_ADD_COLOR)}+{line}{style(RESET)}" for line in content_lines[:MAX_CONTENT_PREVIEW_LINES])
+    if len(content_lines) > MAX_CONTENT_PREVIEW_LINES:
+        lines.append(_dim(f"… {len(content_lines) - MAX_CONTENT_PREVIEW_LINES} more lines"))
+
+    return "\n".join(lines)
+
+
+def tool_detail(name: str, tool_input: dict) -> str:
+    """A short summary of a tool call's real arguments - a diff for Edit, a
+    content preview for Write, a file path/pattern/command for everything
+    else - so a code-writing turn shows real progress in the terminal
+    instead of a bare "⏺ Edit" bullet with nothing after it. Returns "" when
+    the tool has nothing worth showing beyond its own name (an empty/unknown
+    input, or a tool with no recognized argument)."""
+    if name == "Edit":
+        return _edit_detail(tool_input)
+    if name == "Write":
+        return _write_detail(tool_input)
+    if name == "Bash":
+        command = tool_input.get("command", "")
+        return _dim(_truncate(command, MAX_ARG_CHARS)) if command else ""
+    for key in _GENERIC_DETAIL_KEYS:
+        if tool_input.get(key):
+            return _dim(_truncate(str(tool_input[key]), MAX_ARG_CHARS))
+    return ""
 
 
 def thinking_status() -> str:
@@ -164,7 +255,11 @@ class StreamRenderer:
         self._status_shown = True
 
     def handle(self, event: dict) -> None:
-        if event.get("type") != "stream_event":
+        etype = event.get("type")
+        if etype == "assistant":
+            self._handle_assistant(event.get("message", {}))
+            return
+        if etype != "stream_event":
             return
         inner = event.get("event", {})
         itype = inner.get("type")
@@ -172,6 +267,25 @@ class StreamRenderer:
             self._handle_block_start(inner.get("content_block", {}))
         elif itype == "content_block_delta":
             self._handle_delta(inner.get("delta", {}))
+
+    def _handle_assistant(self, message: dict) -> None:
+        """Claude CLI's `assistant` events (distinct from the nested
+        `stream_event` ones handled above) carry each content block's fully
+        reconstructed data once it finishes streaming - notably a tool_use
+        block's complete `input`, already JSON-parsed for us instead of
+        needing to be reassembled from `input_json_delta` fragments
+        ourselves. Confirmed against a real `claude -p` call: one `assistant`
+        event per completed content block, arriving after that block's last
+        delta but before its `content_block_stop` - i.e. right after
+        `_handle_block_start` already printed that block's bullet, so detail
+        is appended directly beneath it rather than treated as a new
+        segment (no `_separate()` call)."""
+        for block in message.get("content", []):
+            if block.get("type") != "tool_use":
+                continue
+            detail = tool_detail(block.get("name", ""), block.get("input") or {})
+            if detail:
+                self._write("\n" + detail)
 
     def _handle_block_start(self, block: dict) -> None:
         btype = block.get("type")
