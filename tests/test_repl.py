@@ -148,7 +148,7 @@ def test_routable_tiers_against_real_tier_models_with_only_codex_authenticated()
     maps every tier to "claude" today, so authenticating Codex only yields
     zero routable tiers. If tiers.py ever gets a Codex entry, this
     assertion changes - that's the intended signal the limitation note in
-    CLAUDE.md needs revising."""
+    docs/rough-edges.md needs revising."""
     routable, unroutable = routable_tiers({"codex"})
 
     assert routable == {}

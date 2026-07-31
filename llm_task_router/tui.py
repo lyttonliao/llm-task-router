@@ -9,9 +9,8 @@ CLI (a colored role bullet, one-line tool-call summaries, a dim cost/
 duration footer, a transient "thinking" status) - not a pixel-exact clone of
 it, which isn't achievable without reverse-engineering a closed-source
 renderer, and was explicitly rejected as a design direction for this repo
-(see CLAUDE.md, "llm-chat: interactive terminal client" - a raw PTY takeover
-of a live `claude` session was considered and rejected as more fragile than
-the current mechanism).
+(see docs/llm-chat.md - a raw PTY takeover of a live `claude` session was
+considered and rejected as more fragile than the current mechanism).
 
 Colors/bold/dim are gated behind ansi_enabled() (NO_COLOR env var, isatty()
 check) so a piped/logged transcript never fills up with escape-code bytes -

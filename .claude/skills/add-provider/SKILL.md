@@ -35,9 +35,9 @@ the code "looks done" after matching `--help` output alone.
    the shape wrong. Also add a `check_auth() -> tuple[bool, str]` using the
    command identified in step 3, and have `invoke()` call it first and
    short-circuit to `ProviderResult(error="auth check failed: ...")` without
-   touching the real model command when unauthenticated - see CLAUDE.md's
-   "Auth pre-flight check" for why (claude_cli.py/codex_cli.py both follow
-   this shape, use them as the template).
+   touching the real model command when unauthenticated - see
+   `docs/auth-and-providers.md` for why (claude_cli.py/codex_cli.py both
+   follow this shape, use them as the template).
 
 5. **Write mocked-subprocess tests** in `tests/test_<name>.py`, mirroring
    `tests/test_claude_cli.py`/`tests/test_codex_cli.py`: assert the exact
@@ -65,6 +65,7 @@ the code "looks done" after matching `--help` output alone.
    `calibrate-tier` skill first. A tier mapping is only as good as the
    quality floor behind it.
 
-9. **Update this repo's `CLAUDE.md`** - architecture tree, and a "known rough
-   edges" entry for anything still unverified (cost/usage reporting, error
-   edge cases you didn't get to exercise for real).
+9. **Update this repo's `CLAUDE.md`'s architecture tree, and add a "known
+   rough edges" entry** to `docs/rough-edges.md` for anything still
+   unverified (cost/usage reporting, error edge cases you didn't get to
+   exercise for real).

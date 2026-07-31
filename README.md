@@ -269,6 +269,55 @@ export DATABASE_URL=postgresql:///llm_task_router
 
 ### 4. Seed the tier-2 vector store
 
+Before running this step (or any first call that reaches tier 2 — `embed()`
+in `embeddings.py` lazy-loads `sentence-transformers/all-MiniLM-L6-v2` from
+Hugging Face Hub the first time it's called), make sure `HF_HUB_OFFLINE`
+isn't already set to `1` in your shell — nothing in this repo sets it, but a
+shell profile/container image/another project might:
+
+```bash
+export HF_HUB_OFFLINE=0   # or just `unset HF_HUB_OFFLINE`
+```
+
+If it's already `1` with nothing cached yet, the first embedding call fails
+outright: there's no local cache for `sentence-transformers` to fall back
+to, so "offline mode" has nothing to serve.
+
+**Once the model is cached, flip this the other way — set `HF_HUB_OFFLINE=1`.**
+This isn't just an optional preference: without it, every fresh process that
+imports `embeddings.py` (`llm-route`, `llm-chat`,
+`llm-route-audit-tier2`, `scripts/seed_vector_store.py` — anything that
+touches tier 2) makes a network round-trip to Hugging Face Hub on startup to
+check for a newer model revision, *even though the file is already cached
+locally and gets loaded from there either way*. That round-trip is what
+prints:
+
+```
+Warning: You are sending unauthenticated requests to the HF Hub. Please set
+a HF_TOKEN to enable higher rate limits and faster downloads.
+```
+
+This is a harmless, non-fatal warning — it comes from an `X-HF-Warning`
+response header the Hub sends back on anonymous requests
+(`huggingface_hub`'s own `utils/_http.py`), not an error, and the model
+still loads correctly afterward. But since `llm-chat`/`llm-route` are each a
+fresh process per run, `huggingface_hub`'s usual "only warn once" dedup
+resets every time, so it reprints on every single invocation until that
+revalidation call is skipped entirely:
+
+```bash
+export HF_HUB_OFFLINE=1
+```
+
+The warning's suggested fix (create a real Hugging Face account token and
+set `HF_TOKEN`) is the *other* valid way to quiet it, but is unnecessary
+overhead here — this repo only ever requests one fixed, small, public model
+name (`MODEL_NAME` in `embeddings.py`), so there's never a reason to check
+for a newer revision, and going offline is simpler than managing a Hub
+credential for a model this project doesn't need auth to use at all. Put
+`export HF_HUB_OFFLINE=1` in your shell profile once the first run below has
+completed and populated the cache (`~/.cache/huggingface/` by default).
+
 Tier 2 starts empty and needs the `llm-eval-harness` sibling repo checked
 out alongside this one (default path `../llm-eval-harness`) to cold-start
 from its 98 golden cases:
@@ -346,6 +395,38 @@ call) at real per-call cost (~$0.07-0.30/call), under
 `--permission-mode bypassPermissions` since there's no TTY for an approval
 prompt in a headless call.
 
+#### Running `llm-chat` from anywhere (not just inside this repo)
+
+`uv run llm-chat` only resolves the entrypoint when your shell's `cwd` is
+inside this repo (or `--project` points at it). To call `llm-chat`
+regardless of which directory you're standing in — including from an
+unrelated, non-Python project (a Go module, a Node app, your home
+directory) — install it as a global `uv` tool instead:
+
+```bash
+cd /path/to/llm-task-router
+uv tool install --editable .
+```
+
+This is `uv`'s equivalent of `pipx install` / `go install` / `npm install
+-g`: a one-time install that drops thin shim executables (`llm-chat`,
+`llm-route`, `llm-route-audit-tier2`, `llm-route-shadow-report`) into
+`~/.local/bin` — `uv`'s own default shim directory, already on `$PATH` if
+`uv` itself is runnable from your shell. `--editable` means source edits in
+this repo take effect immediately, no reinstall step. Anyone cloning this
+repo runs the same command from repo root to get the same result — no
+machine-specific PATH edit to redo per clone.
+
+**Worth knowing before you do this:** `llm-chat` never sets an explicit
+working directory for its underlying `claude -p` calls, so it inherits
+whatever directory you ran it from — a message you type while `cwd` is some
+other project operates on *that* project's files, not this repo's. And
+because every call already runs under `--permission-mode bypassPermissions`
+(above), there's no one-time "do you trust this folder?" prompt the way
+plain interactive `claude` shows the first time you use it somewhere new —
+tool access is silent and immediate in whatever directory you happen to be
+in when a message routes to a tool-capable tier.
+
 ### Auditing tier 2 and shadow-eval divergence
 
 Two more installed console scripts, both read-only (they print a report,
@@ -377,7 +458,7 @@ scheduler should page on.
 
 Both scripts are meant to run daily via cron/launchd/Task Scheduler so
 `routing_decisions` accumulates enough data to judge tier-1-vs-tier-2
-divergence over time. See `CLAUDE.md`, "Scheduling audits" for ready-to-adapt
+divergence over time. See `docs/scheduling-audits.md` for ready-to-adapt
 cron, launchd `.plist`, and Windows `schtasks` recipes.
 
 ### Adding a provider
@@ -385,14 +466,14 @@ cron, launchd `.plist`, and Windows `schtasks` recipes.
 See the `add-provider` skill (`.claude/skills/add-provider/SKILL.md`) for the
 full workflow. Don't add a new entry to `tiers.TIER_MODELS` or
 `classifier.TYPE_DOMAIN_GRID` without real calibration data from
-`llm-eval-harness`'s `calibrate-tier` skill first — see `CLAUDE.md`, "Adding
-a provider."
+`llm-eval-harness`'s `calibrate-tier` skill first — see
+`docs/auth-and-providers.md`, "Adding a provider."
 
 ## Status
 
 Implements a two-tier classifier cascade as of 2026-07-27 (the original
-three-tier design was revised during review - see `CLAUDE.md`, "The
-classifier is a two-tier cascade"): tier 1's heuristic grid, and tier 2, a
+three-tier design was revised during review - see `docs/classifier.md`):
+tier 1's heuristic grid, and tier 2, a
 continuous-learning classifier (local embeddings + a pgvector-backed store
 of labeled examples, with a cheap-LLM fallback that writes its own answer
 back). Claude + Codex provider adapters and a Claude-only tier map are also

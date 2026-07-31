@@ -3,9 +3,9 @@ startup (offering to run each provider's own login command interactively),
 then routes each message through router.route_and_run(). Every message in a
 chat_loop() run shares one session_id, so conversation history continues
 across messages even as the classifier routes different messages to
-different Claude tiers/models - see CLAUDE.md, "llm-chat: interactive
-terminal client" for the real-CLI verification this rests on and for why
-cross-provider continuity (Codex) isn't part of this.
+different Claude tiers/models - see docs/llm-chat.md for the real-CLI
+verification this rests on and for why cross-provider continuity (Codex)
+isn't part of this.
 
 Streaming + styling, added 2026-07-27: chat_loop() prints the routing header
 as soon as route_and_run() resolves it (via on_decision), then streams the
@@ -96,8 +96,8 @@ def routable_tiers(authenticated_providers: set[str], tier_models: dict = TIER_M
     called completely unmodified for every real message (see chat_loop).
     Because TIER_MODELS maps every tier to "claude" today, authenticating
     Codex only yields an empty routable dict - a real, documented
-    consequence of tiers.py's current calibration state (see CLAUDE.md),
-    not something this feature works around."""
+    consequence of tiers.py's current calibration state (see
+    docs/rough-edges.md), not something this feature works around."""
     routable = {}
     unroutable = {}
     for tier, (provider, model) in tier_models.items():
@@ -240,7 +240,7 @@ def main() -> None:
     if not routable:
         print(
             "No routing tier currently points at a provider you're authenticated "
-            "with - see CLAUDE.md's tier calibration status. Exiting."
+            "with - see docs/rough-edges.md's tier calibration status. Exiting."
         )
         sys.exit(1)
 

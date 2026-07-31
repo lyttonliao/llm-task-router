@@ -6,14 +6,14 @@ benchmarking harness, so this file does NOT strip the system prompt or
 disable tools/MCP the way eval_harness/claude_cli.py does. Real tools, real
 system prompt, real CLAUDE.md/hooks all work here, at the real per-call cost
 that comes with that (~$0.07-0.30/call observed, vs. ~$0.003-0.005/call
-stripped - see CLAUDE.md, "llm-chat" for the full tradeoff). This file is
+stripped - see docs/llm-chat.md for the full tradeoff). This file is
 independent from llm-eval-harness's copy (see that repo's "Why it's built
 this way") - changing this adapter has no effect on that repo's calibration
 cost model.
 
 Session continuity: `--session-id <uuid>` establishes a new conversation;
 reusing that same flag on a later call FAILS ("Session ID ... is already in
-use" - confirmed against real output, not guessed, see CLAUDE.md). The
+use" - confirmed against real output, not guessed, see docs/llm-chat.md). The
 correct mechanism for every call after the first is `--resume <uuid>`, which
 does correctly continue the conversation even across a --model change.
 `_established_sessions` tracks, per Python process, which session ids have

@@ -2,9 +2,9 @@
 (see /Users/lliao/.claude/plans/i-believe-for-now-smooth-cook.md for the full
 design). Deliberately module-level, not wrapped in a class that needs
 instantiation - `router.PROVIDERS` already learned the hard way (see
-CLAUDE.md, "Adding a provider", point 2) that a pre-grabbed function
-reference silently defeats `patch()` in tests; tests here patch
-`llm_task_router.embeddings.SentenceTransformer` and
+docs/auth-and-providers.md, "Adding a provider", point 2) that a
+pre-grabbed function reference silently defeats `patch()` in tests; tests
+here patch `llm_task_router.embeddings.SentenceTransformer` and
 `llm_task_router.embeddings.embed` directly instead.
 
 Runtime dependency reversal, scoped to this module (and vector_store.py):

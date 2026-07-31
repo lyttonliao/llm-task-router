@@ -1,0 +1,166 @@
+# llm-chat: interactive terminal client
+
+`llm-chat` (`repl.py`) is a real interactive session: authenticate each
+provider once at startup, then route each typed message independently via
+`route_and_run()` — stateless per call, but see session continuity below.
+Built so engineers without an API budget get a live-routing chat experience
+off existing Claude/ChatGPT subscriptions; no code path touches
+`ANTHROPIC_API_KEY`/`OPENAI_API_KEY`.
+
+## Session continuity
+
+`TaskRequest.session_id` is generated once per `chat_loop()` run (not per
+message) and threaded through `route_and_run() -> provider.invoke(...,
+session_id=...)` unconditionally. Every message in a session shares one
+`session_id`, so history continues even as different messages route to
+different Claude tiers/models — lets `llm-chat` stay a thin router in front
+of real Claude Code functionality (tools, system prompt, CLAUDE.md/hooks)
+instead of reimplementing an interface that mimics it. (Rejected first: a
+bespoke reimplemented chat interface, and a raw PTY takeover injecting
+`/model` mid-session — undocumented, more fragile.)
+
+Confirmed against real `claude` 2.1.220 output (2026-07-26): the *first*
+call per session uses `--session-id "$SID"`; every call after must use
+`--resume "$SID"` instead — reusing `--session-id` on a second call fails
+outright, but `--resume` correctly continues history across a `--model`
+change. `claude_cli.py` tracks which session ids have had their establishing
+call in a module-level `_established_sessions` set so callers just pass the
+same `session_id` every time without knowing which flag applies.
+
+## Full functionality, not cost-minimized
+
+A deliberate choice distinct from `llm-eval-harness`'s adapter.
+`providers/claude_cli.py` doesn't strip the system prompt or disable
+tools/MCP: real tools, system prompt, CLAUDE.md/hooks all work, at real
+per-call cost (~$0.07-0.30/call vs. eval_harness's ~$0.003-0.005 stripped).
+Tool calls run under `--permission-mode bypassPermissions` since a headless
+call has no TTY for an approval prompt — confirmed executing real commands
+with zero approval prompts. **No default timeout as of 2026-07-31** — this
+went through two fixed defaults (60s, then 300s) that both turned out to be
+arbitrary guesses a real session blew past: 300s killed a real multi-file
+editing turn mid-task, discarding the whole already-paid-for result even
+though the terminal had already rendered everything up to that point live,
+and separately, real sessions here have legitimately run well past 30
+minutes (e.g. driving a full test sweep). `llm-chat` is interactive — the
+user is physically present, and Ctrl-C already interrupts a blocking
+`select.select()` call directly, making an internal wall-clock guess
+redundant at best. `LLM_CHAT_TIMEOUT_S` is an opt-in ceiling for callers
+that do want one (e.g. a non-interactive script with nobody watching to
+press Ctrl-C) — resolved fresh per call via `claude_cli._resolve_timeout_s()`,
+not cached at import, same reasoning as `tui.ansi_enabled()`.
+
+## Cross-provider continuity
+
+**Cross-provider mid-conversation continuity is still unsolved.**
+`codex_cli.invoke` accepts `session_id` for `Provider`-protocol conformance
+but ignores it — `codex exec` has no flag to pre-assign a session id
+(continuation is the separate `codex exec resume <id>` subcommand). Only
+works today because every tier maps to Claude; switching providers
+mid-conversation would break continuity regardless, since each CLI's session
+state is local to it.
+
+## Streaming transport and ANSI styling
+
+`claude_cli.py` switched from `--output-format json` to `--output-format
+stream-json --include-partial-messages --verbose` (`--verbose` is required
+— omitting it is a hard CLI error) — one JSON event per line as it arrives.
+`invoke()` uses `subprocess.Popen`, with a `_drain()` helper reading
+`stdout`/`stderr` concurrently via `select.select()` (avoids the classic
+pipe deadlock a plain `for line in proc.stdout` loop would reintroduce).
+With no `LLM_CHAT_TIMEOUT_S` set (see "Full functionality" above),
+`select.select()`'s own `timeout=` arg is passed `None` and blocks
+indefinitely; only when the env var is set does `_drain()` check a
+wall-clock deadline every iteration. Unix-only —
+`select()` doesn't support pipes on Windows, unverified there. `invoke()`
+gained `on_event: Callable[[dict], None]` (`codex_cli.invoke()` accepts it
+for interface conformance but ignores it). `route_and_run()` gained a
+matching `on_event` passthrough plus `on_decision:
+Callable[[RouteDecision], None]`, fired the instant `route()` resolves.
+
+**Tool-call detail, not just a bare bullet (2026-07-31).** `StreamRenderer`
+originally rendered a tool call as just `⏺ Edit` — a colored bullet and the
+tool name, nothing else, confirmed to read as "blank" on a long real editing
+turn (several Edit/Write calls in a row with no visible progress in between).
+`claude_cli`'s NDJSON stream turns out to already include a top-level
+`assistant` event per completed content block, carrying that block's fully
+reconstructed data — for a `tool_use` block, its complete `input`, already
+JSON-parsed by the CLI itself (confirmed against a real stream capture:
+these arrive after the block's last `input_json_delta` but before its
+`content_block_stop`, i.e. right after `_handle_block_start` already printed
+the bullet for that same block). `StreamRenderer._handle_assistant()`
+consumes these and calls `tui.tool_detail(name, input)`, which renders a real
+unified diff (`difflib.unified_diff`) for `Edit`, a content preview for
+`Write`, and the primary argument (command/file_path/pattern/etc.) for
+everything else — capped at `MAX_DIFF_LINES`/`MAX_CONTENT_PREVIEW_LINES` so
+one huge file doesn't flood the terminal. Appended directly under the
+existing bullet (no `_separate()` call), not treated as a new segment.
+
+`tui.py` is a stdlib-only ANSI styling module (escape codes, not
+`rich`/`textual`), rendering in the visual spirit of Claude Code's own CLI
+— not a pixel-exact clone, not a pty. `chat_loop()` wires a
+`tui.StreamRenderer` into `on_event` for live token-by-token streaming;
+`format_response()` remains the non-streaming formatter (still the pinned
+test contract) but the success path no longer calls it, to avoid
+double-printing.
+
+**Restyle pass (2026-07-30).** `tui.py` gained `ansi_enabled()` (`NO_COLOR`
+env var + `sys.stdout.isatty()`) and a `style(code)` wrapper every
+color/bold/dim-emitting helper routes through — piping `llm-chat` to a file
+no longer fills it with escape-code bytes, but bullets/glyphs/spacing always
+render regardless, so a logged transcript stays structurally readable.
+Recolored the tool-call bullet from amber to green and switched the
+thinking glyph from `✻` to a literal `*` (still `DIM`, not a hardcoded gray
+color — theme-safe across light/dark terminals). `StreamRenderer` now emits
+a white bullet before Claude's own streamed text (previously unprefixed),
+separates every segment (thinking→tool, tool→tool, tool→text, text→tool)
+with a blank line instead of the old asymmetric one-sided spacing, and
+gained a `start()` method that shows a "connecting…" status — cleared by
+the same `\r\x1b[2K` trick as `thinking_status()` — for the dead air between
+`on_decision` firing and the first real stream event (auth check/subprocess
+startup/time-to-first-byte). `chat_loop()` prints a `tui.divider()` (sized
+via `shutil.get_terminal_size`, 80-column fallback, rule only — never for
+text wrapping) plus a blank line before every `you>` prompt after the
+first, and a blank line after the user's line before the header, for
+messages that actually route.
+
+## Testing gotcha
+
+Switching `invoke()` from `subprocess.run` to `subprocess.Popen` silently
+invalidated every test that patched `subprocess.run` — they kept "passing"
+while actually falling through to a real, unmocked call (caught by a
+bash-level timeout after ~15-20 real calls had already gone out). Every
+`claude_cli.py` test now patches `subprocess.Popen` directly. Re-verify with
+the narrowest affected test before trusting a green suite after any future
+change to this call mechanism.
+
+## Known limitations and deferred work
+
+**A static input-box frame was tried and reverted the same day.** `input()`
+hands line editing to the terminal's own readline layer, which
+overwrites/advances at the cursor — no way to keep a border in place once
+text wraps. Doing it properly needs raw terminal mode (`termios`/`tty`) with
+a hand-rolled line editor — declined twice as a much bigger build than
+everything else in this pass. Back to a plain `tui.prompt()`.
+
+**Plan mode is explicitly deferred** — a future two-turn flow
+(`--permission-mode plan` to produce a plan, a follow-up `--resume` call to
+execute it), noted but not designed further until needed.
+
+**Login always defers to the provider's own interactive command.**
+`claude_cli.login()`/`codex_cli.login()` shell out with inherited stdio to
+`claude auth login --claudeai`/`codex login` so the user completes the real
+OAuth/device flow in the same terminal — `repl.py` never parses that flow
+itself, and never trusts `login()`'s exit code as proof of success
+(`check_auth()` afterward is the real source of truth).
+
+**`known_models.py` is informational only** — never consulted by
+`route()`/`route_and_run()`. A hardcoded table of model slugs confirmed
+reachable via this account's calibration history, used solely for `repl.py`'s
+startup summary. Same staleness risk as the Codex slug list it's drawn from.
+
+**Authenticating Codex alone makes zero tiers routable**, since
+`tiers.TIER_MODELS` maps every tier to `"claude"` — `main()` refuses to start
+rather than letting every message fail individually.
+`tests/test_repl.py::test_routable_tiers_against_real_tier_models_with_only_codex_authenticated`
+is pinned against the real `TIER_MODELS` so it starts failing (in the good
+way) the day a Codex tier gets calibrated in.
