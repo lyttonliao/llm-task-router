@@ -169,13 +169,18 @@ def invoke(
     llm-chat's own real messages must never pass this, by design.
 
     permission_mode (default "bypassPermissions", every existing call site
-    unaffected) exists for repl.py's /plan command: confirmed against a real
-    call (2026-07-31) that `--permission-mode plan` genuinely restricts to
-    read-only tools (a Write attempt was refused), but the `ExitPlanMode`
-    tool errors out headlessly ("exists but is not enabled in this
-    context") - there is no structured plan handoff in `-p` mode, only
-    whatever the model says in its final text `result` once it can't call
-    that tool. repl.py treats that prose as the plan to show the user."""
+    unaffected): confirmed against a real call (2026-07-31) that
+    `--permission-mode plan` genuinely restricts to read-only tools (a
+    Write attempt was refused), but the `ExitPlanMode` tool errors out
+    headlessly ("exists but is not enabled in this context") - there is no
+    structured plan handoff in `-p` mode, only whatever the model says in
+    its final text `result` once it can't call that tool. Originally added
+    for repl.py's `/plan` command, which called this at "plan" then
+    "bypassPermissions" across two turns - that command is gone (repl.py's
+    chat_loop() no longer calls invoke() at all, see terminal.py), so
+    nothing in this repo currently passes anything but the default; kept as
+    real Provider-protocol surface for any future one-shot caller that
+    wants it, not dead code."""
     authenticated, auth_error = check_auth()
     if not authenticated:
         return ProviderResult(text="", cost_usd=0.0, duration_ms=0, error=f"auth check failed: {auth_error}")

@@ -386,10 +386,15 @@ def route_and_run(
     per-event streaming (see claude_cli.py); providers that can't stream yet
     (codex_cli.py) accept and ignore it.
 
-    permission_mode is forwarded straight into provider.invoke() too, for
-    repl.py's /plan command - the classification/tier that route() resolves
-    is unaffected either way, this only changes what the resolved provider
-    call is allowed to do once it runs.
+    permission_mode is forwarded straight into provider.invoke() too - the
+    classification/tier that route() resolves is unaffected either way,
+    this only changes what the resolved provider call is allowed to do once
+    it runs. Currently unused by any in-repo caller (cli.py's one-shot
+    `llm-route` command is route_and_run()'s only remaining caller, and it
+    never overrides the "bypassPermissions" default - repl.py's chat_loop()
+    stopped calling route_and_run() entirely once it moved to spawning a
+    native terminal per message, see terminal.py) - kept as real
+    Provider-protocol surface, not dead code.
 
     Once the provider call completes, the real cost/duration are written
     back onto the row route() already logged (decision.decision_log_id) via
