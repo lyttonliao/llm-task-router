@@ -1,6 +1,6 @@
 """Interactive terminal chat client, strictly a routing layer: authenticates
 once per provider at startup (offering to run each provider's own login
-command interactively), then classifies exactly one message via
+command interactively), then for every message classifies via
 router.route() and spawns a real native terminal (terminal.py) running the
 routed claude/codex CLI call - the spawned session is what actually shows
 the response and handles all interactive work (tool use, follow-up turns,
@@ -9,14 +9,22 @@ section and docs/llm-chat.md for the full pivot away from rendering
 provider output in-process (the old route_and_run() + tui.StreamRenderer
 streaming path).
 
-One spawn per chat_loop() run, not one per message (revised 2026-07-31
-after live use of the earlier per-message-spawn design surfaced real
-friction - see docs/llm-chat.md): once a message successfully spawns a
-terminal, chat_loop() returns and llm-chat's job for this run is done.
-Everything after that - follow-up turns, tier switches via the spawned
-session's own /model, more work on the same task - happens natively
-inside that one terminal, not through another round trip to llm-chat's
-own prompt. A genuinely new top-level request needs a fresh llm-chat run.
+Non-blocking spawn per message (revised 2026-07-31 twice in one session -
+see docs/llm-chat.md for the full history): terminal.spawn_provider_session()
+launches the terminal and returns immediately, without waiting for that
+session to exit, so chat_loop() returns to its own prompt right away and
+you can route another message while an earlier spawned session is still
+open. An in-between design (spawn once per run, then chat_loop() itself
+returns) was tried and reverted the same day after live use showed the
+earlier *blocking* per-message design was the actual problem, not the
+per-message part - once spawning stopped blocking, going back to a normal
+loop was the right call. session_established tracks whether this run's
+session_id has had its establishing --session-id call yet, mirroring
+providers/claude_cli.py's own _established_sessions - since spawning is
+non-blocking, a message that arrives before an earlier spawn's session has
+actually finished being created is a real, currently-untested
+--resume race, accepted deliberately (see terminal.py's own docstring)
+rather than reintroducing blocking to avoid it.
 """
 
 import sys
@@ -136,16 +144,26 @@ def format_response(decision, result) -> str:
 
 
 def chat_loop(*, input_fn=input, print_fn=print) -> None:
-    """Loops only over paths that never actually spawned a terminal (blank
-    input, an unknown slash command, route() raising,
-    spawn_provider_session() raising) - re-prompting there just lets the
-    user retry or type something else, no session was ever started. The
-    moment a spawn call succeeds, this function returns (see module
-    docstring for why: one spawn per run, everything after that happens
-    natively inside the spawned terminal, not back at this prompt).
-    session_id is generated once and always passed as the *establishing*
-    --session-id (spawn_provider_session()'s resume defaults to False) -
-    there is never a second spawn in the same run to --resume.
+    """One session_id, generated once here (not per message), is threaded
+    into every route() call and spawn_provider_session() call - the latter
+    turns that into --session-id on the first spawn and --resume on every
+    spawn after (see session_established below), so conversation history
+    continues in the spawned claude/codex session even as the classifier
+    sends different messages to different tiers. Spawning is non-blocking
+    (see terminal.py's module docstring), so chat_loop() returns to this
+    prompt immediately after each spawn - you can route a new message
+    while an earlier spawned session is still open.
+
+    session_established starts False and flips to True right after the
+    first spawn call that doesn't raise - a raise means the terminal never
+    actually launched (unknown provider, unsupported platform, no terminal
+    emulator found, the launcher command itself failing - see terminal.py),
+    so the session was never established on that path. Because spawning no
+    longer waits for the launched session to finish being created,
+    --resume-ing session_id on the very next message is a real,
+    currently-untested race if that message arrives before the prior
+    --session-id call has actually finished establishing it - accepted
+    deliberately, see module docstring.
 
     A boxed input frame (top/bottom border around each prompt) was tried and
     removed the same day: it can't wrap around input that line-wraps in the
@@ -154,12 +172,12 @@ def chat_loop(*, input_fn=input, print_fn=print) -> None:
     module docstring for the full rationale. Plain styled prompt only.
 
     A divider + blank line print before every prompt after the first (so
-    retries don't run together) and a blank line prints after the user's
-    line for messages that actually route (before the header) - the
-    visible gap the user asked around each "you>" prompt. Skipped for
-    blank input and slash commands, which stay tight to the prompt they
-    answer."""
+    turns don't run together) and a blank line prints after the user's line
+    for messages that actually route (before the header) - the visible gap
+    the user asked around each "you>" prompt. Skipped for blank input and
+    slash commands, which stay tight to the prompt they answer."""
     session_id = str(uuid.uuid4())
+    session_established = False
     first_turn = True
     while True:
         if not first_turn:
@@ -201,13 +219,15 @@ def chat_loop(*, input_fn=input, print_fn=print) -> None:
         print_fn(tui.header(decision))
 
         try:
-            terminal.spawn_provider_session(decision.provider, decision.model, session_id, line)
+            terminal.spawn_provider_session(
+                decision.provider, decision.model, session_id, line, resume=session_established
+            )
+            session_established = True
         except Exception as exc:
             print_fn(f"[internal error] {exc!r} - could not open a terminal for this session, try again")
             continue
 
-        print_fn("session ended - restart llm-chat to route another task")
-        return
+        print_fn(f"{tui.style(tui.DIM)}opened in a new terminal{tui.style(tui.RESET)}")
 
 
 def main() -> None:

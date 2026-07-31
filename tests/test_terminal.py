@@ -25,21 +25,15 @@ def test_provider_cli_name_unknown_raises():
 # --- helpers ---
 
 
-def _sentinel_path_for(script_path: str) -> str:
-    return os.path.splitext(script_path)[0] + ".sentinel"
-
-
-def _write_sentinel_side_effect(exit_code: int = 0):
-    """Returns a subprocess.run side_effect that, given the launcher cmd,
-    locates the script path passed to it and writes exit_code to that
-    script's sentinel file - simulating the spawned terminal running the
-    wrapper script and finishing instantly, so the real polling loop in
-    _poll_sentinel exits immediately instead of the test sleeping."""
+def _capture_script_side_effect(captured: dict, script_arg_index: int):
+    """Returns a subprocess.run side_effect that reads back the wrapper
+    script's contents into captured["script"] before the (non-blocking)
+    call returns - since this module no longer waits for anything, tests
+    read the script directly rather than simulating a spawned process."""
 
     def _side_effect(cmd, *args, **kwargs):
-        script_path = next(p for p in cmd if p.endswith((".command", ".sh", ".bat")))
-        with open(_sentinel_path_for(script_path), "w") as f:
-            f.write(str(exit_code))
+        with open(cmd[script_arg_index]) as f:
+            captured["script"] = f.read()
         return Mock(returncode=0)
 
     return _side_effect
@@ -51,11 +45,9 @@ def _write_sentinel_side_effect(exit_code: int = 0):
 @patch("llm_task_router.terminal.platform.system", return_value="Darwin")
 @patch("llm_task_router.terminal.subprocess.run")
 def test_spawn_macos_uses_open_with_command_script(mock_run, mock_system):
-    mock_run.side_effect = _write_sentinel_side_effect(exit_code=0)
+    result = spawn_provider_session("claude", "sonnet", "sid-123", "hello world")
 
-    code = spawn_provider_session("claude", "sonnet", "sid-123", "hello world")
-
-    assert code == 0
+    assert result is None  # non-blocking: nothing to report back
     launch_cmd = mock_run.call_args.args[0]
     assert launch_cmd[0] == "open"
     assert launch_cmd[1].endswith(".command")
@@ -65,16 +57,7 @@ def test_spawn_macos_uses_open_with_command_script(mock_run, mock_system):
 @patch("llm_task_router.terminal.subprocess.run")
 def test_spawn_macos_script_contains_session_id_flag(mock_run, mock_system):
     captured = {}
-
-    def _side_effect(cmd, *args, **kwargs):
-        script_path = cmd[1]
-        with open(script_path) as f:
-            captured["script"] = f.read()
-        with open(_sentinel_path_for(script_path), "w") as f:
-            f.write("0")
-        return Mock(returncode=0)
-
-    mock_run.side_effect = _side_effect
+    mock_run.side_effect = _capture_script_side_effect(captured, script_arg_index=1)
 
     spawn_provider_session("claude", "sonnet", "sid-123", "hello world", resume=False)
 
@@ -91,16 +74,7 @@ def test_spawn_macos_script_cds_into_callers_cwd(mock_run, mock_system):
     this process's cwd on its own - the wrapper script must cd there
     explicitly."""
     captured = {}
-
-    def _side_effect(cmd, *args, **kwargs):
-        script_path = cmd[1]
-        with open(script_path) as f:
-            captured["script"] = f.read()
-        with open(_sentinel_path_for(script_path), "w") as f:
-            f.write("0")
-        return Mock(returncode=0)
-
-    mock_run.side_effect = _side_effect
+    mock_run.side_effect = _capture_script_side_effect(captured, script_arg_index=1)
 
     spawn_provider_session("claude", "sonnet", "sid-123", "hi")
 
@@ -114,16 +88,7 @@ def test_spawn_macos_script_cds_into_callers_cwd(mock_run, mock_system):
 @patch("llm_task_router.terminal.subprocess.run")
 def test_spawn_macos_resume_uses_resume_flag(mock_run, mock_system):
     captured = {}
-
-    def _side_effect(cmd, *args, **kwargs):
-        script_path = cmd[1]
-        with open(script_path) as f:
-            captured["script"] = f.read()
-        with open(_sentinel_path_for(script_path), "w") as f:
-            f.write("0")
-        return Mock(returncode=0)
-
-    mock_run.side_effect = _side_effect
+    mock_run.side_effect = _capture_script_side_effect(captured, script_arg_index=1)
 
     spawn_provider_session("claude", "sonnet", "sid-123", "hi", resume=True)
 
@@ -133,34 +98,33 @@ def test_spawn_macos_resume_uses_resume_flag(mock_run, mock_system):
 
 @patch("llm_task_router.terminal.platform.system", return_value="Darwin")
 @patch("llm_task_router.terminal.subprocess.run")
-def test_spawn_macos_returns_real_exit_code(mock_run, mock_system):
-    mock_run.side_effect = _write_sentinel_side_effect(exit_code=7)
+def test_spawn_macos_script_deletes_itself_as_last_line(mock_run, mock_system):
+    """Non-blocking means this module never learns when the spawned
+    process finishes, so it can't safely delete the wrapper script itself
+    after launching - the script must clean up after its own run instead."""
+    captured = {}
+    mock_run.side_effect = _capture_script_side_effect(captured, script_arg_index=1)
 
-    code = spawn_provider_session("claude", "sonnet", "sid-123", "hi")
+    spawn_provider_session("claude", "sonnet", "sid-123", "hi")
 
-    assert code == 7
+    script_path = mock_run.call_args.args[0][1]
+    lines = captured["script"].splitlines()
+    assert lines[-1] == f"rm -f -- {shlex.quote(script_path)}"
 
 
 @patch("llm_task_router.terminal.platform.system", return_value="Darwin")
 @patch("llm_task_router.terminal.subprocess.run")
-def test_spawn_macos_cleans_up_temp_files(mock_run, mock_system):
-    paths = {}
+def test_spawn_macos_does_not_wait_for_subprocess_run_to_report_completion(mock_run, mock_system):
+    """The whole point of the non-blocking revision: spawn_provider_session
+    must return as soon as the launcher call (`open ...`) itself returns,
+    without any further polling/sleeping - confirmed by never patching in
+    a sentinel file or any completion signal at all and still returning
+    cleanly."""
+    mock_run.return_value = Mock(returncode=0)
 
-    def _side_effect(cmd, *args, **kwargs):
-        script_path = cmd[1]
-        sentinel_path = _sentinel_path_for(script_path)
-        paths["script"] = script_path
-        paths["sentinel"] = sentinel_path
-        with open(sentinel_path, "w") as f:
-            f.write("0")
-        return Mock(returncode=0)
+    spawn_provider_session("claude", "sonnet", "sid-123", "hi")  # must not hang
 
-    mock_run.side_effect = _side_effect
-
-    spawn_provider_session("claude", "sonnet", "sid-123", "hi")
-
-    assert not os.path.exists(paths["script"])
-    assert not os.path.exists(paths["sentinel"])
+    mock_run.assert_called_once()
 
 
 # --- Linux dispatch ---
@@ -171,11 +135,9 @@ def test_spawn_macos_cleans_up_temp_files(mock_run, mock_system):
 @patch("llm_task_router.terminal.subprocess.run")
 def test_spawn_linux_uses_first_available_terminal(mock_run, mock_which, mock_system):
     mock_which.side_effect = lambda name: "/usr/bin/gnome-terminal" if name == "gnome-terminal" else None
-    mock_run.side_effect = _write_sentinel_side_effect(exit_code=0)
 
-    code = spawn_provider_session("claude", "sonnet", "sid-123", "hi")
+    spawn_provider_session("claude", "sonnet", "sid-123", "hi")
 
-    assert code == 0
     launch_cmd = mock_run.call_args.args[0]
     assert launch_cmd[0] == "gnome-terminal"
     assert launch_cmd[1] == "--"
@@ -194,17 +156,8 @@ def test_spawn_linux_raises_when_no_terminal_found(mock_which, mock_system):
 @patch("llm_task_router.terminal.platform.system", return_value="Windows")
 @patch("llm_task_router.terminal.subprocess.run")
 def test_spawn_windows_uses_cmd_start(mock_run, mock_system):
-    def _side_effect(cmd, *args, **kwargs):
-        script_path = next(p for p in cmd if p.endswith(".bat"))
-        with open(_sentinel_path_for(script_path), "w") as f:
-            f.write("0")
-        return Mock(returncode=0)
+    spawn_provider_session("claude", "sonnet", "sid-123", "hi")
 
-    mock_run.side_effect = _side_effect
-
-    code = spawn_provider_session("claude", "sonnet", "sid-123", "hi")
-
-    assert code == 0
     launch_cmd = mock_run.call_args.args[0]
     assert launch_cmd[:3] == ["cmd", "/c", "start"]
 
@@ -218,8 +171,6 @@ def test_spawn_windows_script_cds_into_callers_cwd(mock_run, mock_system):
         script_path = next(p for p in cmd if p.endswith(".bat"))
         with open(script_path) as f:
             captured["script"] = f.read()
-        with open(_sentinel_path_for(script_path), "w") as f:
-            f.write("0")
         return Mock(returncode=0)
 
     mock_run.side_effect = _side_effect
