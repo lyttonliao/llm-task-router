@@ -171,7 +171,10 @@ def resolve_task_type(description: str, embedding: list[float]) -> Tier2Resoluti
     confidently agree. Returns None only when both the NN lookup is
     unconfident AND the LLM fallback is unavailable/unparseable - callers
     treat that the same way as any other tier-2-unavailable case."""
-    matches = vector_store.nearest_neighbors(embedding, "task_type", k=NEIGHBOR_K)
+    try:
+        matches = vector_store.nearest_neighbors(embedding, "task_type", k=NEIGHBOR_K)
+    except Exception:
+        matches = []
     majority = _nn_majority(matches)
     if majority is not None:
         return Tier2Resolution(task_type=majority, source="nn")
@@ -179,7 +182,10 @@ def resolve_task_type(description: str, embedding: list[float]) -> Tier2Resoluti
     label = _classify_task_type_via_llm(description)
     if label is None:
         return None
-    vector_store.insert_example(description, embedding, task_type=label, is_high_stakes=None, source="llm_fallback")
+    try:
+        vector_store.insert_example(description, embedding, task_type=label, is_high_stakes=None, source="llm_fallback")
+    except Exception:
+        pass  # write-back is best-effort - a store failure shouldn't invalidate a resolution we already have
     return Tier2Resolution(task_type=label, source="llm_fallback")
 
 
@@ -196,7 +202,10 @@ def resolve_high_stakes(
     symmetry resolve_task_type already had - a drift-auditing consumer needs
     to know which mechanism produced a live resolution, not just the
     resolution itself."""
-    matches = vector_store.nearest_neighbors(embedding, "is_high_stakes", k=NEIGHBOR_K)
+    try:
+        matches = vector_store.nearest_neighbors(embedding, "is_high_stakes", k=NEIGHBOR_K)
+    except Exception:
+        matches = []
     majority = _nn_majority(matches)
     if majority is not None:
         return HighStakesResolution(is_high_stakes=majority, source="nn")
@@ -204,7 +213,10 @@ def resolve_high_stakes(
     is_high_stakes = _corroborate_high_stakes_via_llm(description)
     if is_high_stakes is None:
         return None
-    vector_store.insert_example(
-        description, embedding, task_type=task_type, is_high_stakes=is_high_stakes, source="llm_fallback"
-    )
+    try:
+        vector_store.insert_example(
+            description, embedding, task_type=task_type, is_high_stakes=is_high_stakes, source="llm_fallback"
+        )
+    except Exception:
+        pass  # write-back is best-effort - a store failure shouldn't invalidate a resolution we already have
     return HighStakesResolution(is_high_stakes=is_high_stakes, source="llm_fallback")

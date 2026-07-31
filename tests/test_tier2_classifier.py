@@ -155,6 +155,49 @@ def test_resolve_task_type_returns_none_on_raised_exception():
     mock_insert.assert_not_called()
 
 
+def test_resolve_task_type_falls_through_to_llm_when_nearest_neighbors_raises():
+    """A real incident: DATABASE_URL unset made vector_store._connect() raise
+    RuntimeError, uncaught here, which propagated out of router.route() and
+    surfaced to the user as "[internal error] ... message not sent" - despite
+    this module's docstring promising None on ANY failure. nearest_neighbors
+    must degrade like an empty NN result, not crash the caller."""
+    with (
+        patch(
+            "llm_task_router.tier2_classifier.vector_store.nearest_neighbors",
+            side_effect=RuntimeError("DATABASE_URL environment variable is not set"),
+        ),
+        patch(
+            "llm_task_router.tier2_classifier.claude_cli.invoke",
+            return_value=ProviderResult(text="CODE_GEN", cost_usd=0.003, duration_ms=400),
+        ) as mock_invoke,
+        patch("llm_task_router.tier2_classifier.vector_store.insert_example") as mock_insert,
+    ):
+        result = resolve_task_type("write a function that validates emails", _EMBEDDING)
+
+    assert result == Tier2Resolution(task_type="code_gen", source="llm_fallback")
+    mock_invoke.assert_called_once()
+    mock_insert.assert_called_once()
+
+
+def test_resolve_task_type_still_returns_llm_result_when_insert_example_raises():
+    """Write-back is best-effort - a store failure during the write-back must
+    not throw away a resolution the LLM fallback already produced."""
+    with (
+        patch("llm_task_router.tier2_classifier.vector_store.nearest_neighbors", return_value=[]),
+        patch(
+            "llm_task_router.tier2_classifier.claude_cli.invoke",
+            return_value=ProviderResult(text="CODE_GEN", cost_usd=0.003, duration_ms=400),
+        ),
+        patch(
+            "llm_task_router.tier2_classifier.vector_store.insert_example",
+            side_effect=RuntimeError("DATABASE_URL environment variable is not set"),
+        ),
+    ):
+        result = resolve_task_type("write a function that validates emails", _EMBEDDING)
+
+    assert result == Tier2Resolution(task_type="code_gen", source="llm_fallback")
+
+
 # --- resolve_high_stakes ---------------------------------------------------
 
 
@@ -243,3 +286,39 @@ def test_resolve_high_stakes_returns_none_on_raised_exception():
 
     assert result is None
     mock_insert.assert_not_called()
+
+
+def test_resolve_high_stakes_falls_through_to_llm_when_nearest_neighbors_raises():
+    with (
+        patch(
+            "llm_task_router.tier2_classifier.vector_store.nearest_neighbors",
+            side_effect=RuntimeError("DATABASE_URL environment variable is not set"),
+        ),
+        patch(
+            "llm_task_router.tier2_classifier.claude_cli.invoke",
+            return_value=ProviderResult(text="YES", cost_usd=0.003, duration_ms=400),
+        ) as mock_invoke,
+        patch("llm_task_router.tier2_classifier.vector_store.insert_example") as mock_insert,
+    ):
+        result = resolve_high_stakes("migrate the k8s cluster to a new region", _EMBEDDING)
+
+    assert result == HighStakesResolution(is_high_stakes=True, source="llm_fallback")
+    mock_invoke.assert_called_once()
+    mock_insert.assert_called_once()
+
+
+def test_resolve_high_stakes_still_returns_llm_result_when_insert_example_raises():
+    with (
+        patch("llm_task_router.tier2_classifier.vector_store.nearest_neighbors", return_value=[]),
+        patch(
+            "llm_task_router.tier2_classifier.claude_cli.invoke",
+            return_value=ProviderResult(text="YES", cost_usd=0.003, duration_ms=400),
+        ),
+        patch(
+            "llm_task_router.tier2_classifier.vector_store.insert_example",
+            side_effect=RuntimeError("DATABASE_URL environment variable is not set"),
+        ),
+    ):
+        result = resolve_high_stakes("migrate the k8s cluster to a new region", _EMBEDDING)
+
+    assert result == HighStakesResolution(is_high_stakes=True, source="llm_fallback")
