@@ -1,17 +1,56 @@
 # llm-chat: interactive terminal client
 
 `llm-chat` (`repl.py`) is a pure routing/classification layer as of
-2026-07-31 (see "Spawn-per-message pivot" and "One spawn per run" below):
-authenticate each provider once at startup, then classify exactly one
-typed message via `route()` and spawn a real native terminal
-(`terminal.py`) running the routed `claude`/`codex` CLI call — the spawned
-session, not `llm-chat`, handles everything else (tool use, follow-up
-turns, plan mode, more turns on the same task), and `llm-chat`'s job for
-that run ends there. Built so engineers without an API budget get a
-live-routing chat experience off existing Claude/ChatGPT subscriptions; no
-code path touches `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`.
+2026-07-31 (see "Non-blocking spawn" below, current; "One spawn per run"
+and "Spawn-per-message pivot" further down are both superseded but kept
+for history): authenticate each provider once at startup, then for every
+typed message classify via `route()` and spawn a real native terminal
+(`terminal.py`) running the routed `claude`/`codex` CLI call, without
+waiting for it to finish — the spawned session, not `llm-chat`, handles
+everything else (tool use, follow-up turns, plan mode, more turns on the
+same task), and `llm-chat`'s own prompt is available again immediately,
+not once that session exits. Built so engineers without an API budget get
+a live-routing chat experience off existing Claude/ChatGPT subscriptions;
+no code path touches `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`.
 
-## One spawn per run, not one per message (2026-07-31, same-day follow-up)
+## Non-blocking spawn, per-message loop restored (2026-07-31, third same-day revision)
+
+**Supersedes "One spawn per run" below**, which itself superseded the
+original "Spawn-per-message pivot" further down - three revisions to this
+same design landed in one session, each one driven by actually using the
+previous version, not by further planning in the abstract.
+
+**What went wrong with "one spawn per run"**: it fixed the "new window per
+message" friction by spawning once and then having `chat_loop()` itself
+return - but that made the *real* problem (spawning blocked until the
+spawned session fully exited) worse, not better, since now the entire
+`llm-chat` process sat there unresponsive for exactly as long as the one
+session stayed open. The user hit this twice, once badly enough to need
+Ctrl-C to escape a stuck wait - even after separately confirming, the
+first time it came up, that blocking was the design they wanted. Living
+with it a second time changed that answer.
+
+**The fix**: `terminal.spawn_provider_session()` is now non-blocking - it
+launches the terminal and returns as soon as the launch itself succeeds,
+never waiting for the spawned session to exit (see `terminal.py`'s own
+module docstring for the mechanism: the wrapper script now deletes itself
+as its last line, since this module no longer learns when it's safe to
+clean up from a poll loop that no longer exists). `chat_loop()` goes back
+to looping and re-prompting immediately after every spawn - the
+`session_established`/`resume` bookkeeping that "One spawn per run"
+deleted is back, since there can be more than one spawn per run again.
+
+**A real, accepted tradeoff**: because spawning doesn't wait, a second
+message can now route and spawn *while an earlier spawned session is
+still being created*. If that second message needs `--resume` on the same
+`session_id`, and the first spawn's `claude`/`codex` process hasn't
+actually finished registering that session yet, the `--resume` call could
+race it - untested territory (confirmed by the user as an accepted
+tradeoff, not overlooked: keeping shared conversation history across
+messages was judged more valuable than eliminating this race by giving
+every spawn its own independent `session_id` instead).
+
+## One spawn per run, not one per message (2026-07-31, same-day follow-up, superseded - see "Non-blocking spawn" above)
 
 **Supersedes the per-message-spawn design in "Spawn-per-message pivot"
 below.** Landing spawn-per-message and actually using it live surfaced two
@@ -23,32 +62,30 @@ window for *every single message* meant a full exit-and-return cycle even
 for an ordinary follow-up on the same task - real friction, not a
 hypothetical one, confirmed by using it.
 
-**The fix**: `chat_loop()` now spawns exactly once per run. The first
-message classifies and spawns a terminal as before; once that spawn call
-succeeds, `chat_loop()` returns immediately instead of prompting for
-another message. Everything after that - follow-ups, exploring, switching
-tiers via the spawned session's own `/model` - happens natively inside
-that one already-open terminal, never through another round trip to
-`llm-chat`'s own prompt. A genuinely new top-level request needs a fresh
-`llm-chat` run. This also deletes the `session_established`/`resume`
-bookkeeping entirely: there is never a second spawn in the same run to
-`--resume`, every spawn is always the establishing `--session-id` call.
+**The fix, as originally shipped (now itself superseded - see above)**:
+`chat_loop()` spawned exactly once per run, deleting the
+`session_established`/`resume` bookkeeping entirely on the theory that
+there'd never be a second spawn in the same run. That held for less than
+a day: making the block itself the thing worth fixing (see "Non-blocking
+spawn" above) meant a second spawn per run became possible again, and
+`session_established`/`resume` came back with it. The rest of this
+section's reasoning (once real, now historical) follows.
 
-**Honest framing, not softened**: this does narrow "per-message routing" in
-practice, even though the classifier itself is unchanged. Under this
-design, only the first message of an `llm-chat` run ever gets classified -
-every follow-up inside the spawned session goes straight to the native
-`claude`/`codex` process, unrouted, the same as typing into any ordinary
-`claude` session. Re-routing a follow-up now requires fully restarting
-`llm-chat` (a new run, a new top-level classification), not just returning
-to a still-open prompt. The "Architectural decision" section below still
-calls per-message routing non-negotiable; read that now as "the message
-that starts a run is always classified," not "every line of dialogue,
-forever, is reclassified" - the latter was already mostly theoretical even
-under the per-message-spawn design (a follow-up typed inside an
-already-open spawned terminal was never being reclassified either; the
-difference is that path is now the *only* path, not merely the common
-one).
+Originally: The first message classifies and spawns a terminal as before;
+once that spawn call succeeds, `chat_loop()` returns immediately instead
+of prompting for another message. Everything after that - follow-ups,
+exploring, switching tiers via the spawned session's own `/model` -
+happens natively inside that one already-open terminal, never through
+another round trip to `llm-chat`'s own prompt. A genuinely new top-level
+request needs a fresh `llm-chat` run.
+
+**This "honest framing" paragraph described the one-spawn-per-run design
+and is now itself historical** - per-message classification is back (see
+"Non-blocking spawn" above), so `llm-chat`'s "every message independently"
+claim in the "Architectural decision" section below is accurate again at
+face value, not just at the run-boundary level this paragraph argued for.
+Kept for history since it was real reasoning at the time, not because it
+still describes current behavior.
 
 ## Spawn-per-message pivot (2026-07-31, superseded same-day - see "One spawn per run" above)
 
@@ -314,19 +351,25 @@ continuously, the other intercepts between messages. Rebuilding Claude Code's in
 `prompt_toolkit` to bridge that gap trades a one-time engineering cost for permanent maintenance
 burden, since the UI layer diverges every time Anthropic ships a feature there.
 
-**The current answer, as of the same-day "One spawn per run" revision** (superseding the paragraph
-after this one, which described spawning per message): `llm-chat` provides readline history via
-`input()` and cost-aware routing for exactly one message per run, spawns a real native terminal
-running the routed `claude`/`codex` CLI call for that message, then gets out of the way entirely —
-see "One spawn per run" near the top of this doc. Live use of the per-message version (spawn on
-every message, reclassify after every exit) showed the friction wasn't worth it: real conversations
-don't need re-routing on every line, and a new terminal window per line was worse UX than routing
-once and letting the native session run. A new top-level request means a new `llm-chat` run, not a
-returned-to prompt.
+**The current answer, as of the same-day "Non-blocking spawn" revision** (see near the top of this
+doc): `llm-chat` classifies and spawns for **every** message again, same as the paragraph after
+this one — what changed is that spawning no longer blocks. `chat_loop()` fires the spawn and
+returns to its own prompt immediately, so you can route another message while an earlier spawned
+session is still open, without the one-spawn-per-run detour in between (see below) ever having been
+the right fix for what was actually broken.
 
-**Superseded same-day, kept for history**: the version below this one had `llm-chat` spawn a
+**Superseded same-day, kept for history**: in between the original per-message design and the
+current one, `llm-chat` briefly spawned exactly one terminal per run and then got out of the way
+entirely — see "One spawn per run" near the top of this doc. That fixed the "new window per
+message" complaint but made the real problem (spawning *blocking* until the session exited) worse,
+not better, since it meant the whole `llm-chat` process sat unresponsive for as long as that one
+session stayed open. Reverted the same day once that became clear from actually using it.
+
+**Superseded earlier, kept for history**: the version below this one had `llm-chat` spawn a
 terminal for **every** message, not just the first — real native UX per message, but at the cost of
-one terminal window per line of dialogue and a full exit/return cycle between them.
+one terminal window per line of dialogue and a full exit/return cycle between them (the *blocking*
+part of that cost is what's fixed now; the "one terminal window per message" part was judged, after
+living with the alternative, to be the lesser problem).
 
 *Superseded, kept for history*: the original plan was narrower — basic interactivity plus
 slash-command dispatch (`/plan`, `/clear`, etc., all since removed) as `llm-chat`'s own affordances,
