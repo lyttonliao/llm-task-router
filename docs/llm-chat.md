@@ -1,11 +1,54 @@
 # llm-chat: interactive terminal client
 
-`llm-chat` (`repl.py`) is a real interactive session: authenticate each
-provider once at startup, then route each typed message independently via
-`route_and_run()` — stateless per call, but see session continuity below.
-Built so engineers without an API budget get a live-routing chat experience
-off existing Claude/ChatGPT subscriptions; no code path touches
+`llm-chat` (`repl.py`) is a pure routing/classification layer as of
+2026-07-31 (see "Spawn-per-message pivot" below): authenticate each
+provider once at startup, then for every typed message classify via
+`route()` and spawn a real native terminal (`terminal.py`) running the
+routed `claude`/`codex` CLI call — the spawned session, not `llm-chat`,
+handles everything else (tool use, follow-up turns, plan mode). Built so
+engineers without an API budget get a live-routing chat experience off
+existing Claude/ChatGPT subscriptions; no code path touches
 `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`.
+
+## Spawn-per-message pivot (2026-07-31)
+
+`chat_loop()` no longer calls `route_and_run()` or wires up
+`tui.StreamRenderer` — full design at
+`~/.claude/plans/what-s-our-next-goal-jazzy-tome.md` (this machine/user's
+plans directory, not in-repo), summarized in this repo's `CLAUDE.md`. New
+flow per message: `route()` classifies only (no provider call in-process),
+`tui.header(decision)` prints the routing decision, then
+`terminal.spawn_provider_session(decision.provider, decision.model,
+session_id, message, resume=session_established)` opens a real terminal
+window running that CLI call with an inherited TTY and blocks until it
+exits — see `terminal.py`'s own module docstring for the disposable
+wrapper-script + sentinel-file mechanism this uses to detect "the spawned
+process exited" despite `open -a Terminal`/equivalents not blocking
+themselves. `session_established` is a local bool in `chat_loop()`, not
+`claude_cli.py`'s module-level `_established_sessions` set — each spawned
+session is a separate OS process, so per-process in-memory tracking in
+`claude_cli.py` doesn't apply to it at all; see `chat_loop()`'s own
+docstring for exactly when this flips to `True`.
+
+**Slash commands narrowed to `/exit`/`/quit` only.** `/help`, `/clear`, and
+`/plan` are removed outright (not deprecated-in-place) — user's explicit
+choice among three options (none at all / `/exit`+`/quit` only /
+`/exit`+`/quit`+`/clear`) once `llm-chat` become strictly task routing.
+`/plan`'s two-turn flow (see "Plan mode" below) and `/clear`'s session reset
+(see "`/clear`" below) are both superseded, not replaced 1:1 — the user now
+gets real `/plan` natively inside the spawned interactive session (no
+headless `ExitPlanMode` limitation there), and there is no `/clear`
+equivalent at all (no way to reset `session_id` mid-run; a fresh
+conversation means restarting `llm-chat`).
+
+**Not deleted in this pass**: `tui.StreamRenderer` and `repl.format_response()`
+are now provably unreferenced by any application code (confirmed via grep —
+`route_and_run()` survives only via `cli.py`'s one-shot `llm-route`
+command, which touches neither). Per the referenced plan's explicit
+"incrementally, not upfront" removal policy, they stay in the codebase
+until a separate, later pass confirms the spawn flow has been used for a
+while and removes what's still provably dead then — not as an automatic
+follow-on to landing this wiring.
 
 ## Session continuity
 
@@ -60,6 +103,15 @@ mid-conversation would break continuity regardless, since each CLI's session
 state is local to it.
 
 ## Streaming transport and ANSI styling
+
+**`chat_loop()` no longer wires any of this up as of the 2026-07-31
+spawn-per-message pivot (see above)** — `claude_cli.invoke()`'s
+`stream-json` transport and `on_event`/`on_decision` plumbing described
+below are still real (still used by `cli.py`'s one-shot `route_and_run()`
+path and internally by `router.py`'s tier-3 classification fallback), and
+`tui.StreamRenderer` still exists and is still tested, but `chat_loop()`
+itself doesn't construct or feed it anymore. Left as history below, not
+rewritten.
 
 `claude_cli.py` switched from `--output-format json` to `--output-format
 stream-json --include-partial-messages --verbose` (`--verbose` is required
@@ -142,7 +194,11 @@ text wraps. Doing it properly needs raw terminal mode (`termios`/`tty`) with
 a hand-rolled line editor — declined twice as a much bigger build than
 everything else in this pass. Back to a plain `tui.prompt()`.
 
-**Plan mode (`/plan <description>`), implemented 2026-07-31** — the
+**Plan mode (`/plan <description>`), implemented 2026-07-31, removed the
+same day by the spawn-per-message pivot (see "Spawn-per-message pivot"
+above)** — `/plan` no longer exists in `chat_loop()`; the user gets real
+`/plan` natively inside the spawned interactive session instead, without
+the headless `ExitPlanMode` limitation described below. Left as history:
 two-turn flow sketched above, built once real `claude -p` behavior was
 checked instead of assumed. Confirmed against a real call: `--permission-mode
 plan` genuinely restricts the model to read-only tools (a `Write` attempt was
@@ -164,7 +220,10 @@ is accepted-but-ignored, same conformance pattern as `on_event` — `codex
 exec` has no plan-mode analog) to carry this through
 `route_and_run()` unchanged for every existing caller.
 
-**`/clear`, added alongside plan mode (2026-07-31)** — reassigns
+**`/clear`, added alongside plan mode (2026-07-31), removed the same day
+by the spawn-per-message pivot (see above)** — `chat_loop()` has no
+command to reset `session_id` mid-run anymore; a fresh conversation means
+restarting `llm-chat`. Left as history: `/clear` used to reassign
 `chat_loop()`'s `session_id` local to a fresh uuid, the one deliberate
 exception to "generated once per run" (see `chat_loop()`'s docstring). The
 next message establishes a brand new `claude` session instead of
@@ -204,12 +263,20 @@ continuously, the other intercepts between messages. Rebuilding Claude Code's in
 `prompt_toolkit` to bridge that gap trades a one-time engineering cost for permanent maintenance
 burden, since the UI layer diverges every time Anthropic ships a feature there.
 
-**The practical answer**: `llm-chat` provides basic interactivity (readline history via `input()`,
-slash-command dispatch) and cost-aware routing. When a conversation requires more intense/precise
-communication (complex refactoring, high-stakes work, exploration needing iteration), a future
-`/handoff` command will save the session and launch a real `claude --resume` session, handing the
-user full native UX while keeping the routing decisions logged. For now, users escalate to `claude`
-directly when they need it.
+**The practical answer, as of the 2026-07-31 spawn-per-message pivot** (superseding the paragraph
+below, which described the design *before* this shipped): `llm-chat` provides readline history via
+`input()` and cost-aware routing, then spawns a real native terminal running the routed
+`claude`/`codex` CLI call for **every** message, not just an opt-in escalation — see
+"Spawn-per-message pivot" near the top of this doc. The user gets full native UX for every routed
+message, not a light tool that occasionally hands off to a heavier one.
+
+*Superseded, kept for history*: the original plan was narrower — basic interactivity plus
+slash-command dispatch (`/plan`, `/clear`, etc., all since removed) as `llm-chat`'s own affordances,
+with a future `/handoff` command reserved for conversations needing more intense/precise
+communication (complex refactoring, high-stakes work, exploration needing iteration) to save the
+session and launch a real `claude --resume` session. That framing generalized into spawn-per-message
+by default instead of an opt-in escalation — same conclusion (don't rebuild Claude Code's interactive
+layer), different delivery mechanism.
 
 This isn't a limitation to work around — it's a design decision with real tradeoffs. Don't revisit
 it.

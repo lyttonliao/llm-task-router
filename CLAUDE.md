@@ -26,22 +26,37 @@ is deliberately **not** being deleted as part of this pivot — it stays until
 the spawn model is verified end to end and confirmed unreferenced by an
 actual grep, not assumed.
 
-Two of the plan's steps are done: the word-wrap rewrite is committed
-(`75b33d3`), and `llm_task_router/terminal.py` — the platform-dispatch spawn
-primitive (`spawn_provider_session()`), with a disposable wrapper-script +
-sentinel-file poll loop so it can block until the spawned CLI exits despite
-`open -a Terminal`/equivalents not blocking themselves — is committed
-(`e2123c1`), covered by mocked tests, macOS-verified only (Linux/Windows
-dispatch is written but unverified against real installs, same unverified
-status as this repo's Windows `select()` gap — see `docs/rough-edges.md`).
-**Not done yet, and the next concrete step**: `terminal.py` is not wired into
-`repl.py:chat_loop()` — no real user message reaches it. That wiring
-(rewriting `chat_loop()`'s control flow to classify → print decision → call
-`spawn_provider_session()` → loop, plus what happens to `/model`, `/plan`,
-and a possible `/handoff` command under the new flow — see the referenced
-plan's steps 2-4) is its own pass, deliberately not bundled with landing the
-spawn primitive itself. A real end-to-end smoke test (type a message, watch
-a terminal actually open) can't happen until that wiring exists.
+The pivot has landed: word-wrap rewrite (`75b33d3`), `llm_task_router/terminal.py`
+— the platform-dispatch spawn primitive (`spawn_provider_session()`), with a
+disposable wrapper-script + sentinel-file poll loop so it can block until
+the spawned CLI exits despite `open -a Terminal`/equivalents not blocking
+themselves — (`e2123c1`), and `repl.py:chat_loop()` wired to call it
+(`0c176fb`): every message now classifies via `route()` only, prints the
+decision, and spawns a real terminal for the actual `claude`/`codex` call —
+no more `route_and_run()`/`StreamRenderer` on this path. Along the way the
+user settled `llm-chat` as **strictly task routing**: only `/exit`/`/quit`
+survive of the old slash commands, `/help`/`/clear`/`/plan` are removed
+outright (not deprecated-in-place) — see `docs/llm-chat.md`'s
+"Spawn-per-message pivot" section for the full reasoning. macOS-verified
+only for `terminal.py` itself (mocked tests only); Linux/Windows dispatch is
+written but unverified against real installs, same unverified status as
+this repo's Windows `select()` gap — see `docs/rough-edges.md`.
+`StreamRenderer`/`repl.format_response()` are now provably unreferenced by
+any application code (confirmed by grep — `route_and_run()` survives only
+via `cli.py`'s one-shot `llm-route` command) but are deliberately **not**
+deleted yet, per the referenced plan's "incrementally, not upfront" removal
+policy — a separate, later pass once the spawn flow has actually been used
+for a while.
+
+**Not done yet, and the next concrete step**: a real end-to-end smoke test
+of `chat_loop()` — type a message, confirm a terminal window actually opens
+running the routed `claude`/`codex` call, confirm control returns to
+`llm-chat`'s prompt on exit, confirm `--session-id` vs `--resume` is chosen
+correctly across messages. This is the first time `terminal.py` is
+reachable from a real message, and hasn't been run live yet (it makes a
+real, billed provider call and opens a real terminal window - deliberately
+not triggered automatically as part of landing the wiring, see
+`docs/llm-chat.md`).
 
 Separately still true and unaffected by the above: `audit_tier2`/
 `shadow_report` launchd jobs are live on this dev machine
