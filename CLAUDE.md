@@ -16,19 +16,32 @@ UI — menus, inline diffs, arrow-key history — a permanent maintenance burden
 against a target this repo doesn't control). New flow: classify the message,
 print the routing decision, spawn a **real native terminal** running
 `claude --model <tier's model> --session-id <sid> "<message>"` with a real
-inherited TTY (same `login()`-shells-out-with-inherited-stdio pattern
-`claude_cli.py` already uses), let the user drive that session with full
-native functionality, and return to `llm-chat`'s prompt when they exit.
-Per-message routing is unchanged and non-negotiable (see
-`docs/llm-chat.md`'s "Architectural decision" section and this project's
-memory — don't relitigate why full-interactive-UX-in-`llm-chat` was rejected,
-it's a structural incompatibility, not an oversight). Existing
-`StreamRenderer`/streaming code is deliberately **not** being deleted as part
-of this pivot — it stays until the spawn model is verified end to end
-(macOS first; Linux/Windows terminal-spawning is unverified) and confirmed
-unreferenced by an actual grep, not assumed. Next concrete steps in the plan:
-commit the already-green, currently-uncommitted word-wrap rewrite first, then
-build `llm_task_router/terminal.py` (the platform-dispatch spawn function).
+inherited TTY, let the user drive that session with full native
+functionality, and return to `llm-chat`'s prompt when they exit. Per-message
+routing is unchanged and non-negotiable (see `docs/llm-chat.md`'s
+"Architectural decision" section and this project's memory — don't relitigate
+why full-interactive-UX-in-`llm-chat` was rejected, it's a structural
+incompatibility, not an oversight). Existing `StreamRenderer`/streaming code
+is deliberately **not** being deleted as part of this pivot — it stays until
+the spawn model is verified end to end and confirmed unreferenced by an
+actual grep, not assumed.
+
+Two of the plan's steps are done: the word-wrap rewrite is committed
+(`75b33d3`), and `llm_task_router/terminal.py` — the platform-dispatch spawn
+primitive (`spawn_provider_session()`), with a disposable wrapper-script +
+sentinel-file poll loop so it can block until the spawned CLI exits despite
+`open -a Terminal`/equivalents not blocking themselves — is committed
+(`e2123c1`), covered by mocked tests, macOS-verified only (Linux/Windows
+dispatch is written but unverified against real installs, same unverified
+status as this repo's Windows `select()` gap — see `docs/rough-edges.md`).
+**Not done yet, and the next concrete step**: `terminal.py` is not wired into
+`repl.py:chat_loop()` — no real user message reaches it. That wiring
+(rewriting `chat_loop()`'s control flow to classify → print decision → call
+`spawn_provider_session()` → loop, plus what happens to `/model`, `/plan`,
+and a possible `/handoff` command under the new flow — see the referenced
+plan's steps 2-4) is its own pass, deliberately not bundled with landing the
+spawn primitive itself. A real end-to-end smoke test (type a message, watch
+a terminal actually open) can't happen until that wiring exists.
 
 Separately still true and unaffected by the above: `audit_tier2`/
 `shadow_report` launchd jobs are live on this dev machine
