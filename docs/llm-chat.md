@@ -1,34 +1,76 @@
 # llm-chat: interactive terminal client
 
 `llm-chat` (`repl.py`) is a pure routing/classification layer as of
-2026-07-31 (see "Spawn-per-message pivot" below): authenticate each
-provider once at startup, then for every typed message classify via
-`route()` and spawn a real native terminal (`terminal.py`) running the
-routed `claude`/`codex` CLI call — the spawned session, not `llm-chat`,
-handles everything else (tool use, follow-up turns, plan mode). Built so
-engineers without an API budget get a live-routing chat experience off
-existing Claude/ChatGPT subscriptions; no code path touches
-`ANTHROPIC_API_KEY`/`OPENAI_API_KEY`.
+2026-07-31 (see "Spawn-per-message pivot" and "One spawn per run" below):
+authenticate each provider once at startup, then classify exactly one
+typed message via `route()` and spawn a real native terminal
+(`terminal.py`) running the routed `claude`/`codex` CLI call — the spawned
+session, not `llm-chat`, handles everything else (tool use, follow-up
+turns, plan mode, more turns on the same task), and `llm-chat`'s job for
+that run ends there. Built so engineers without an API budget get a
+live-routing chat experience off existing Claude/ChatGPT subscriptions; no
+code path touches `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`.
 
-## Spawn-per-message pivot (2026-07-31)
+## One spawn per run, not one per message (2026-07-31, same-day follow-up)
+
+**Supersedes the per-message-spawn design in "Spawn-per-message pivot"
+below.** Landing spawn-per-message and actually using it live surfaced two
+problems in the same session: (1) the spawned terminal launched in the
+user's home directory instead of the repo `llm-chat` was run from (fixed
+separately - see `terminal.py`'s `_spawn_macos()`, an explicit `cd` into
+the caller's `cwd`), and (2) reclassifying and opening a brand-new terminal
+window for *every single message* meant a full exit-and-return cycle even
+for an ordinary follow-up on the same task - real friction, not a
+hypothetical one, confirmed by using it.
+
+**The fix**: `chat_loop()` now spawns exactly once per run. The first
+message classifies and spawns a terminal as before; once that spawn call
+succeeds, `chat_loop()` returns immediately instead of prompting for
+another message. Everything after that - follow-ups, exploring, switching
+tiers via the spawned session's own `/model` - happens natively inside
+that one already-open terminal, never through another round trip to
+`llm-chat`'s own prompt. A genuinely new top-level request needs a fresh
+`llm-chat` run. This also deletes the `session_established`/`resume`
+bookkeeping entirely: there is never a second spawn in the same run to
+`--resume`, every spawn is always the establishing `--session-id` call.
+
+**Honest framing, not softened**: this does narrow "per-message routing" in
+practice, even though the classifier itself is unchanged. Under this
+design, only the first message of an `llm-chat` run ever gets classified -
+every follow-up inside the spawned session goes straight to the native
+`claude`/`codex` process, unrouted, the same as typing into any ordinary
+`claude` session. Re-routing a follow-up now requires fully restarting
+`llm-chat` (a new run, a new top-level classification), not just returning
+to a still-open prompt. The "Architectural decision" section below still
+calls per-message routing non-negotiable; read that now as "the message
+that starts a run is always classified," not "every line of dialogue,
+forever, is reclassified" - the latter was already mostly theoretical even
+under the per-message-spawn design (a follow-up typed inside an
+already-open spawned terminal was never being reclassified either; the
+difference is that path is now the *only* path, not merely the common
+one).
+
+## Spawn-per-message pivot (2026-07-31, superseded same-day - see "One spawn per run" above)
 
 `chat_loop()` no longer calls `route_and_run()` or wires up
 `tui.StreamRenderer` — full design at
 `~/.claude/plans/what-s-our-next-goal-jazzy-tome.md` (this machine/user's
-plans directory, not in-repo), summarized in this repo's `CLAUDE.md`. New
-flow per message: `route()` classifies only (no provider call in-process),
-`tui.header(decision)` prints the routing decision, then
+plans directory, not in-repo), summarized in this repo's `CLAUDE.md`.
+**The per-message part of this section is superseded** (see above) - the
+mechanics below (route() classifies only, terminal.spawn_provider_session()
+opens the terminal via a disposable wrapper-script + sentinel-file poll
+loop) are all still accurate and current, but the original code sample
+here showed a `resume=session_established` kwarg that no longer exists:
+`chat_loop()` now spawns at most once per run, always establishing
+(`--session-id`), never resuming, so that bookkeeping was deleted rather
+than kept dormant. Flow per run: `route()` classifies only (no provider
+call in-process), `tui.header(decision)` prints the routing decision, then
 `terminal.spawn_provider_session(decision.provider, decision.model,
-session_id, message, resume=session_established)` opens a real terminal
-window running that CLI call with an inherited TTY and blocks until it
-exits — see `terminal.py`'s own module docstring for the disposable
-wrapper-script + sentinel-file mechanism this uses to detect "the spawned
-process exited" despite `open -a Terminal`/equivalents not blocking
-themselves. `session_established` is a local bool in `chat_loop()`, not
-`claude_cli.py`'s module-level `_established_sessions` set — each spawned
-session is a separate OS process, so per-process in-memory tracking in
-`claude_cli.py` doesn't apply to it at all; see `chat_loop()`'s own
-docstring for exactly when this flips to `True`.
+session_id, message)` opens a real terminal window running that CLI call
+with an inherited TTY and blocks until it exits — see `terminal.py`'s own
+module docstring for the disposable wrapper-script + sentinel-file
+mechanism this uses to detect "the spawned process exited" despite
+`open -a Terminal`/equivalents not blocking themselves.
 
 **Slash commands narrowed to `/exit`/`/quit` only.** `/help`, `/clear`, and
 `/plan` are removed outright (not deprecated-in-place) — user's explicit
@@ -51,6 +93,15 @@ while and removes what's still provably dead then — not as an automatic
 follow-on to landing this wiring.
 
 ## Session continuity
+
+**As of the "One spawn per run" pivot above, `chat_loop()` itself never
+reaches the `--resume` case** described below - it spawns at most once per
+run, always as the establishing `--session-id` call. The mechanism
+(`route_and_run() -> provider.invoke(..., session_id=...)`,
+`_established_sessions`) is still real and still exercised by `cli.py`'s
+one-shot `route_and_run()` path, which can `--resume` a `session_id`
+passed in from outside; `chat_loop()` just never generates more than one
+message against its own `session_id` to trigger that path anymore.
 
 `TaskRequest.session_id` is generated once per `chat_loop()` run (not per
 message) and threaded through `route_and_run() -> provider.invoke(...,
@@ -263,12 +314,19 @@ continuously, the other intercepts between messages. Rebuilding Claude Code's in
 `prompt_toolkit` to bridge that gap trades a one-time engineering cost for permanent maintenance
 burden, since the UI layer diverges every time Anthropic ships a feature there.
 
-**The practical answer, as of the 2026-07-31 spawn-per-message pivot** (superseding the paragraph
-below, which described the design *before* this shipped): `llm-chat` provides readline history via
-`input()` and cost-aware routing, then spawns a real native terminal running the routed
-`claude`/`codex` CLI call for **every** message, not just an opt-in escalation — see
-"Spawn-per-message pivot" near the top of this doc. The user gets full native UX for every routed
-message, not a light tool that occasionally hands off to a heavier one.
+**The current answer, as of the same-day "One spawn per run" revision** (superseding the paragraph
+after this one, which described spawning per message): `llm-chat` provides readline history via
+`input()` and cost-aware routing for exactly one message per run, spawns a real native terminal
+running the routed `claude`/`codex` CLI call for that message, then gets out of the way entirely —
+see "One spawn per run" near the top of this doc. Live use of the per-message version (spawn on
+every message, reclassify after every exit) showed the friction wasn't worth it: real conversations
+don't need re-routing on every line, and a new terminal window per line was worse UX than routing
+once and letting the native session run. A new top-level request means a new `llm-chat` run, not a
+returned-to prompt.
+
+**Superseded same-day, kept for history**: the version below this one had `llm-chat` spawn a
+terminal for **every** message, not just the first — real native UX per message, but at the cost of
+one terminal window per line of dialogue and a full exit/return cycle between them.
 
 *Superseded, kept for history*: the original plan was narrower — basic interactivity plus
 slash-command dispatch (`/plan`, `/clear`, etc., all since removed) as `llm-chat`'s own affordances,

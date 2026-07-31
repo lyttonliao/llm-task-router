@@ -7,56 +7,52 @@ prompt/model quality offline to calibrate the tiers this router picks from.
 
 ## Next step (updated 2026-07-31)
 
-**`llm-chat` is being rearchitected into a pure routing/classification layer** —
-full design at `~/.claude/plans/what-s-our-next-goal-jazzy-tome.md` (this
-machine/user's plans directory, not in-repo). Short version: `llm-chat` stops
-trying to render provider output itself (the custom `StreamRenderer`/`tui.py`
-streaming path was chasing feature parity with Claude Code's own interactive
-UI — menus, inline diffs, arrow-key history — a permanent maintenance burden
-against a target this repo doesn't control). New flow: classify the message,
-print the routing decision, spawn a **real native terminal** running
+**`llm-chat` is now a pure routing/classification layer** — full design at
+`~/.claude/plans/what-s-our-next-goal-jazzy-tome.md` (this machine/user's
+plans directory, not in-repo; describes the original per-message-spawn
+version, since revised - see below). `llm-chat` no longer renders provider
+output itself (the custom `StreamRenderer`/`tui.py` streaming path was
+chasing feature parity with Claude Code's own interactive UI — a permanent
+maintenance burden against a target this repo doesn't control). Current
+flow, landed and **live-verified** (2026-07-31): `chat_loop()` classifies
+one message via `route()`, prints the decision, spawns a real native
+terminal via `terminal.spawn_provider_session()` running
 `claude --model <tier's model> --session-id <sid> "<message>"` with a real
-inherited TTY, let the user drive that session with full native
-functionality, and return to `llm-chat`'s prompt when they exit. Per-message
-routing is unchanged and non-negotiable (see `docs/llm-chat.md`'s
-"Architectural decision" section and this project's memory — don't relitigate
-why full-interactive-UX-in-`llm-chat` was rejected, it's a structural
-incompatibility, not an oversight). Existing `StreamRenderer`/streaming code
-is deliberately **not** being deleted as part of this pivot — it stays until
-the spawn model is verified end to end and confirmed unreferenced by an
-actual grep, not assumed.
+inherited TTY, blocks until that session exits, then returns — **one spawn
+per `llm-chat` run, not one per message** (see `docs/llm-chat.md`'s "One
+spawn per run" section for why this changed from the original per-message
+design the same day it shipped). Only `/exit`/`/quit` survive of the old
+slash commands; `/help`, `/clear`, `/plan` are removed outright.
 
-The pivot has landed: word-wrap rewrite (`75b33d3`), `llm_task_router/terminal.py`
-— the platform-dispatch spawn primitive (`spawn_provider_session()`), with a
-disposable wrapper-script + sentinel-file poll loop so it can block until
-the spawned CLI exits despite `open -a Terminal`/equivalents not blocking
-themselves — (`e2123c1`), and `repl.py:chat_loop()` wired to call it
-(`0c176fb`): every message now classifies via `route()` only, prints the
-decision, and spawns a real terminal for the actual `claude`/`codex` call —
-no more `route_and_run()`/`StreamRenderer` on this path. Along the way the
-user settled `llm-chat` as **strictly task routing**: only `/exit`/`/quit`
-survive of the old slash commands, `/help`/`/clear`/`/plan` are removed
-outright (not deprecated-in-place) — see `docs/llm-chat.md`'s
-"Spawn-per-message pivot" section for the full reasoning. macOS-verified
-only for `terminal.py` itself (mocked tests only); Linux/Windows dispatch is
-written but unverified against real installs, same unverified status as
-this repo's Windows `select()` gap — see `docs/rough-edges.md`.
-`StreamRenderer`/`repl.format_response()` are now provably unreferenced by
-any application code (confirmed by grep — `route_and_run()` survives only
-via `cli.py`'s one-shot `llm-route` command) but are deliberately **not**
-deleted yet, per the referenced plan's "incrementally, not upfront" removal
-policy — a separate, later pass once the spawn flow has actually been used
-for a while.
+**Two real bugs only surfaced by actually running this live**, not by the
+mocked test suite: (1) the spawned terminal launched in the user's home
+directory instead of the repo `llm-chat` was run from — `open`/equivalents
+don't inherit the caller's `cwd`, fixed with an explicit `cd` in the
+wrapper script (`1f2a06f`); (2) spawning a brand-new terminal window *per
+message* meant a full exit-and-return cycle for every ordinary follow-up
+on the same task — real friction, not hypothetical, that drove the
+one-spawn-per-run redesign (`a7d0740`). Both are a live reminder that
+`terminal.py`'s mocked tests only ever verify command construction, never
+what actually happens once a real shell runs — see that module's own
+"Verified" docstring section, which now documents both gaps.
 
-**Not done yet, and the next concrete step**: a real end-to-end smoke test
-of `chat_loop()` — type a message, confirm a terminal window actually opens
-running the routed `claude`/`codex` call, confirm control returns to
-`llm-chat`'s prompt on exit, confirm `--session-id` vs `--resume` is chosen
-correctly across messages. This is the first time `terminal.py` is
-reachable from a real message, and hasn't been run live yet (it makes a
-real, billed provider call and opens a real terminal window - deliberately
-not triggered automatically as part of landing the wiring, see
-`docs/llm-chat.md`).
+Commits: word-wrap rewrite (`75b33d3`), `terminal.py` spawn primitive
+(`e2123c1`), `chat_loop()` wiring + slash-command removal (`0c176fb`),
+docs (`36751ac`), cwd fix (`1f2a06f`), one-spawn-per-run redesign
+(`a7d0740`). `StreamRenderer`/`repl.format_response()` are provably
+unreferenced by any application code (confirmed by grep — `route_and_run()`
+survives only via `cli.py`'s one-shot `llm-route` command) but are
+deliberately **not** deleted yet, per the referenced plan's
+"incrementally, not upfront" removal policy. macOS-verified end to end;
+Linux/Windows terminal-spawning remains unverified against real installs,
+same status as this repo's Windows `select()` gap — see
+`docs/rough-edges.md`.
+
+**Not done yet, and the next concrete step**: no open item from this pivot
+specifically — the design is landed and live-verified on macOS. Remaining
+work is the pre-existing parked threads below (Codex tier calibration,
+Windows/Linux verification) plus whatever surfaces from continued daily
+use.
 
 Separately still true and unaffected by the above: `audit_tier2`/
 `shadow_report` launchd jobs are live on this dev machine
