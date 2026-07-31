@@ -1,4 +1,5 @@
 import os
+import shlex
 from unittest.mock import Mock, patch
 
 import pytest
@@ -79,6 +80,34 @@ def test_spawn_macos_script_contains_session_id_flag(mock_run, mock_system):
 
     assert "claude --model sonnet --session-id sid-123" in captured["script"]
     assert "hello world" in captured["script"]
+
+
+@patch("llm_task_router.terminal.platform.system", return_value="Darwin")
+@patch("llm_task_router.terminal.subprocess.run")
+def test_spawn_macos_script_cds_into_callers_cwd(mock_run, mock_system):
+    """Regression test: the first real macOS run (2026-07-31) launched
+    claude in the user's home directory instead of the repo llm-chat was
+    started from, since a freshly opened Terminal window doesn't inherit
+    this process's cwd on its own - the wrapper script must cd there
+    explicitly."""
+    captured = {}
+
+    def _side_effect(cmd, *args, **kwargs):
+        script_path = cmd[1]
+        with open(script_path) as f:
+            captured["script"] = f.read()
+        with open(_sentinel_path_for(script_path), "w") as f:
+            f.write("0")
+        return Mock(returncode=0)
+
+    mock_run.side_effect = _side_effect
+
+    spawn_provider_session("claude", "sonnet", "sid-123", "hi")
+
+    lines = captured["script"].splitlines()
+    assert lines[1] == f"cd -- {shlex.quote(os.getcwd())}"
+    # the cd must run before the actual provider command
+    assert lines.index(lines[1]) < next(i for i, line in enumerate(lines) if line.startswith("claude "))
 
 
 @patch("llm_task_router.terminal.platform.system", return_value="Darwin")
@@ -178,6 +207,26 @@ def test_spawn_windows_uses_cmd_start(mock_run, mock_system):
     assert code == 0
     launch_cmd = mock_run.call_args.args[0]
     assert launch_cmd[:3] == ["cmd", "/c", "start"]
+
+
+@patch("llm_task_router.terminal.platform.system", return_value="Windows")
+@patch("llm_task_router.terminal.subprocess.run")
+def test_spawn_windows_script_cds_into_callers_cwd(mock_run, mock_system):
+    captured = {}
+
+    def _side_effect(cmd, *args, **kwargs):
+        script_path = next(p for p in cmd if p.endswith(".bat"))
+        with open(script_path) as f:
+            captured["script"] = f.read()
+        with open(_sentinel_path_for(script_path), "w") as f:
+            f.write("0")
+        return Mock(returncode=0)
+
+    mock_run.side_effect = _side_effect
+
+    spawn_provider_session("claude", "sonnet", "sid-123", "hi")
+
+    assert f'cd /d "{os.getcwd()}"' in captured["script"]
 
 
 # --- Unsupported platform ---

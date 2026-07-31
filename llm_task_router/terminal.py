@@ -31,12 +31,17 @@ interrupts a blocking loop (time.sleep raises KeyboardInterrupt same as
 select.select() does there), and a wall-clock guess would be as likely to
 kill a legitimately long-running session as an actually-stuck one.
 
-Verified: macOS only (this machine's daily dev environment), by direct
-manual testing with the /model command not yet wired in (see the
-terminal.py plan's "Explicitly out of scope" section) - the sentinel-file
-polling logic itself IS covered by mocked tests
-(tests/test_terminal.py), but no real terminal window has been opened by
-this module yet outside that manual check.
+Verified: macOS only (this machine's daily dev environment). A real
+end-to-end run (2026-07-31, once wired into repl.py:chat_loop()) confirmed
+the terminal genuinely opens and the message reaches a real interactive
+claude session - but also caught a real bug the mocked tests couldn't:
+the spawned shell's default startup directory is the user's home
+directory, not the caller's cwd, so the first real run launched claude in
+the wrong place entirely. Fixed by an explicit `cd` in the wrapper script
+before the actual command (see _spawn_macos()) - the sentinel-file polling
+logic itself was already covered by mocked tests (tests/test_terminal.py),
+but "what directory does the spawned process start in" was not something
+those tests exercised, since they never actually launch a shell.
 
 NOT verified at all: Linux (gnome-terminal/konsole/xterm dispatch is
 written to the same pattern documented above but never run against a real
@@ -82,14 +87,15 @@ def spawn_provider_session(
     cli = provider_cli_name(provider)
     session_flag = "--resume" if resume else "--session-id"
     cmd = [cli, "--model", model, session_flag, session_id, message]
+    cwd = os.getcwd()
 
     system = platform.system()
     if system == "Darwin":
-        return _spawn_macos(cmd)
+        return _spawn_macos(cmd, cwd)
     if system == "Linux":
-        return _spawn_linux(cmd)
+        return _spawn_linux(cmd, cwd)
     if system == "Windows":
-        return _spawn_windows(cmd)
+        return _spawn_windows(cmd, cwd)
     raise ValueError(f"unsupported platform for terminal spawning: {system}")
 
 
@@ -100,18 +106,29 @@ def _poll_sentinel(sentinel_path: str) -> int:
         return int(f.read().strip())
 
 
-def _spawn_macos(cmd: list[str]) -> int:
+def _spawn_macos(cmd: list[str], cwd: str) -> int:
     """Writes a .command file (macOS Terminal's double-click/open
     association for shell scripts) and opens it via `open`, which launches
     a new Terminal window running the script - launcher call itself
     returns immediately, so completion is detected via the sentinel file
-    the script writes on exit, not via `open`'s own return."""
+    the script writes on exit, not via `open`'s own return.
+
+    `open`/Terminal.app start the new window's shell at its own default
+    startup directory (the user's home directory), NOT the calling
+    process's cwd - confirmed against a real spawn (2026-07-31): the
+    spawned session's own startup banner reported "launched claude in your
+    home directory" instead of the repo llm-chat was run from. The `cd`
+    below is what actually fixes that, not something `open` does for
+    free."""
     run_id = uuid.uuid4().hex
     tmp_dir = tempfile.gettempdir()
     script_path = os.path.join(tmp_dir, f"llm-chat-spawn-{run_id}.command")
     sentinel_path = os.path.join(tmp_dir, f"llm-chat-spawn-{run_id}.sentinel")
 
-    script = f"#!/bin/bash\n{shlex.join(cmd)}\necho $? > {shlex.quote(sentinel_path)}\n"
+    script = (
+        f"#!/bin/bash\ncd -- {shlex.quote(cwd)}\n{shlex.join(cmd)}\n"
+        f"echo $? > {shlex.quote(sentinel_path)}\n"
+    )
     with open(script_path, "w") as f:
         f.write(script)
     os.chmod(script_path, 0o700)
@@ -127,13 +144,15 @@ def _spawn_macos(cmd: list[str]) -> int:
                 pass
 
 
-def _spawn_linux(cmd: list[str]) -> int:
+def _spawn_linux(cmd: list[str], cwd: str) -> int:
     """Best-effort, unverified against a real Linux desktop (see module
     docstring). Picks the first available terminal emulator on PATH from
     _LINUX_TERMINALS; each is invoked to run the same disposable wrapper
     script + sentinel-file pattern _spawn_macos uses, since none of these
     emulators' "wait for exit" flags (e.g. newer gnome-terminal's --wait)
-    are universal enough to depend on."""
+    are universal enough to depend on. Same explicit `cd` as _spawn_macos -
+    a freshly opened terminal emulator window has no reason to inherit this
+    process's cwd on its own."""
     terminal = next((t for t in _LINUX_TERMINALS if shutil.which(t)), None)
     if terminal is None:
         raise RuntimeError(
@@ -146,7 +165,10 @@ def _spawn_linux(cmd: list[str]) -> int:
     script_path = os.path.join(tmp_dir, f"llm-chat-spawn-{run_id}.sh")
     sentinel_path = os.path.join(tmp_dir, f"llm-chat-spawn-{run_id}.sentinel")
 
-    script = f"#!/bin/bash\n{shlex.join(cmd)}\necho $? > {shlex.quote(sentinel_path)}\n"
+    script = (
+        f"#!/bin/bash\ncd -- {shlex.quote(cwd)}\n{shlex.join(cmd)}\n"
+        f"echo $? > {shlex.quote(sentinel_path)}\n"
+    )
     with open(script_path, "w") as f:
         f.write(script)
     os.chmod(script_path, 0o700)
@@ -162,17 +184,23 @@ def _spawn_linux(cmd: list[str]) -> int:
                 pass
 
 
-def _spawn_windows(cmd: list[str]) -> int:
+def _spawn_windows(cmd: list[str], cwd: str) -> int:
     """Best-effort, unverified against real Windows (see module docstring).
     `.bat` equivalent of the sentinel-file pattern the other platforms use;
-    `cmd /c start "" cmd /c <script>` opens a new console window."""
+    `cmd /c start "" cmd /c <script>` opens a new console window. `cd /d`
+    (not plain `cd`) so this also switches drive letters when cwd is on a
+    different one than the new console's own default - same "don't inherit
+    the caller's cwd for free" gap as the other two platforms."""
     run_id = uuid.uuid4().hex
     tmp_dir = tempfile.gettempdir()
     script_path = os.path.join(tmp_dir, f"llm-chat-spawn-{run_id}.bat")
     sentinel_path = os.path.join(tmp_dir, f"llm-chat-spawn-{run_id}.sentinel")
 
     quoted_cmd = " ".join(f'"{part}"' if " " in part else part for part in cmd)
-    script = f"@echo off\r\n{quoted_cmd}\r\necho %errorlevel% > {sentinel_path}\r\n"
+    script = (
+        f'@echo off\r\ncd /d "{cwd}"\r\n{quoted_cmd}\r\n'
+        f"echo %errorlevel% > {sentinel_path}\r\n"
+    )
     with open(script_path, "w") as f:
         f.write(script)
 
