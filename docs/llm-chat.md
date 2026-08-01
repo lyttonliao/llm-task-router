@@ -1,19 +1,111 @@
 # llm-chat: interactive terminal client
 
 `llm-chat` (`repl.py`) is a pure routing/classification layer as of
-2026-07-31 (see "Non-blocking spawn" below, current; "One spawn per run"
-and "Spawn-per-message pivot" further down are both superseded but kept
-for history): authenticate each provider once at startup, then for every
-typed message classify via `route()` and spawn a real native terminal
-(`terminal.py`) running the routed `claude`/`codex` CLI call, without
-waiting for it to finish — the spawned session, not `llm-chat`, handles
-everything else (tool use, follow-up turns, plan mode, more turns on the
-same task), and `llm-chat`'s own prompt is available again immediately,
-not once that session exits. Built so engineers without an API budget get
-a live-routing chat experience off existing Claude/ChatGPT subscriptions;
+2026-07-31 (see "Persistent tmux session" below, current; every other
+section down through "Spawn-per-message pivot" is superseded but kept for
+history — the design churned through four revisions in one day, each
+driven by actually using the previous one): authenticate each provider
+once at startup, then for every typed message classify via `route()` and
+deliver it into a single persistent `tmux`-backed terminal session
+(`terminal.py`) running the routed `claude`/`codex` CLI, without ever
+spawning a second process for that run — the tmux session, not
+`llm-chat`, handles everything else (tool use, follow-up turns, plan
+mode, more turns on the same task), and `llm-chat`'s own prompt is
+available again immediately after each message is delivered, not once
+that session exits. Built so engineers without an API budget get a
+live-routing chat experience off existing Claude/ChatGPT subscriptions;
 no code path touches `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`.
 
-## Non-blocking spawn, per-message loop restored (2026-07-31, third same-day revision)
+## Persistent tmux session, not spawn-per-message (2026-07-31, fourth same-day revision)
+
+**Supersedes "Non-blocking spawn" below**, which itself superseded "One
+spawn per run", which superseded the original "Spawn-per-message pivot" -
+four revisions to this same design landed in one day, each driven by
+actually using the previous version.
+
+**What was wrong with spawning per message**: every message (after the
+first) opened a *brand new terminal window and a brand new `claude`
+process*, using `--resume <session_id>` so the new process reloaded the
+prior transcript from disk. Live use surfaced this as the wrong model —
+the user wants one continuing place to watch the conversation, not a new
+window per message — and because spawning was non-blocking (see "Non-blocking
+spawn" below), a fast second message could fire its `--resume` call before
+the first spawn's `--session-id` call had actually finished registering
+the session on disk. That race was accepted as a documented tradeoff at
+the time; it turned out to be indistinguishable, from the user's side,
+from "every message starts a new session" - the exact complaint that
+triggered this revision.
+
+**The fix**: stop spawning a new provider CLI process per message
+entirely. `terminal.py` gained three functions that replace
+`spawn_provider_session()`:
+
+- `create_session(provider, model, session_id, cwd)` — synchronous, runs
+  once per `chat_loop()` run: `tmux new-session -d -s <session_id> -c
+  <cwd> -- <cli> --model <model> --session-id <session_id>`. Starts the
+  provider CLI interactively under a *detached* tmux session — tmux always
+  gives a pane a real pty, so the CLI's raw-mode interactive TUI works
+  exactly as if a human were typing, with no window visible yet.
+- `attach_terminal(session_id, cwd)` — the one and only external terminal
+  spawn per run, reusing the same non-blocking wrapper-script machinery
+  `spawn_provider_session()` used (cwd `cd`, self-deleting script,
+  `open`/terminal-emulator/`cmd start` dispatch) - just running `tmux
+  attach -t <session_id>` instead of the provider CLI directly.
+- `send_message(session_id, text)` — the delivery primitive for every
+  message, including the first: `tmux send-keys -t <session_id> -l -- <text>`
+  followed by a separate `tmux send-keys -t <session_id> Enter`. This
+  injects keystrokes into the *same still-running* process exactly as a
+  human typing into the attached window would — indistinguishable from
+  the CLI's own perspective.
+- `switch_model(session_id, model)` — thin wrapper around `send_message()`
+  sending the provider CLI's own `/model <name>` slash command. Confirmed
+  against the installed `claude` 2.1.220 binary's own usage string
+  (`Usage: /model <name>. Available: ..., default, or a full model ID.`)
+  that this takes a direct argument, not just the interactive picker — not
+  yet live-verified end to end under tmux injection (see "Not yet
+  verified" below).
+
+`chat_loop()` now tracks `session_created` (has `create_session()` +
+`attach_terminal()` run yet) and `active_model` (which model the live
+session is currently running as) instead of the old
+`session_established`/`resume` pair. Per message: if the session doesn't
+exist yet, create + attach it; if the routed model differs from
+`active_model`, send a `/model` switch first; then `send_message()` the
+actual text. Because delivery is now a synchronous call from `chat_loop()`'s
+own process rather than an external spawn, and the loop is single-threaded,
+there is only ever one live provider process and messages are delivered
+strictly in order — the `--resume` race is gone structurally, not
+mitigated.
+
+**New hard dependency: `tmux`.** Not a new Python package (the "stdlib-only
+CLI layer" rule is unaffected) but a new external CLI, like `claude`/`codex`
+themselves. Chosen over `screen` (already present on this machine, no
+install needed) because tmux gives each pane a real pty and has a cleaner,
+less fragile scripting interface (`send-keys -l`, `new-session -d`) than
+`screen -X stuff`. `terminal.tmux_available()` is checked once in `main()`
+before `chat_loop()` starts, printing a clear "install tmux" message and
+exiting rather than letting `create_session()` raise a raw
+`FileNotFoundError` mid-session.
+
+**Known limitation, explicitly not solved by this design**: switching
+*provider* (not just model) mid-session doesn't work. `/model` only
+operates within a single already-running CLI's own session; there is no
+equivalent for jumping from a live `claude` process to `codex`
+mid-conversation — that would need an entirely different tmux session
+tied to a different CLI. Moot today since `TIER_MODELS` maps every tier to
+`claude` (see "Known limitations and deferred work" below and
+`docs/rough-edges.md`'s Codex-calibration note), but would need solving
+before any Codex tier lands.
+
+**Not yet verified live** (the mocked test suite only verifies command
+construction — see "Testing gotcha" below): whether `/model` needs a
+settling beat before the next `send-keys` call lands cleanly, and whether
+`tiers.py`'s stored model strings are accepted as-is by `/model` (only
+confirmed that `/model <name>` accepts a direct argument at all, not that
+it behaves correctly when driven via `send-keys` rather than a real
+keypress).
+
+## Non-blocking spawn, per-message loop restored (2026-07-31, third same-day revision, superseded - see "Persistent tmux session" above)
 
 **Supersedes "One spawn per run" below**, which itself superseded the
 original "Spawn-per-message pivot" further down - three revisions to this
@@ -131,24 +223,28 @@ follow-on to landing this wiring.
 
 ## Session continuity
 
-**As of the "One spawn per run" pivot above, `chat_loop()` itself never
-reaches the `--resume` case** described below - it spawns at most once per
-run, always as the establishing `--session-id` call. The mechanism
+**Superseded by "Persistent tmux session" above** for `chat_loop()`
+specifically: there is now exactly one provider CLI process per run
+(created via `terminal.create_session()`, never re-spawned), so the
+`--session-id`/`--resume` distinction described below no longer applies to
+`chat_loop()` at all — `/model` switching, once rejected below as "a raw
+PTY takeover ... undocumented, more fragile", is exactly what
+`terminal.switch_model()` now does, just via `tmux send-keys` rather than a
+hand-rolled PTY. The mechanism described in this section
 (`route_and_run() -> provider.invoke(..., session_id=...)`,
 `_established_sessions`) is still real and still exercised by `cli.py`'s
-one-shot `route_and_run()` path, which can `--resume` a `session_id`
-passed in from outside; `chat_loop()` just never generates more than one
-message against its own `session_id` to trigger that path anymore.
+one-shot `route_and_run()` path, which can `--resume` a `session_id` passed
+in from outside — `chat_loop()` just doesn't use that path anymore.
 
 `TaskRequest.session_id` is generated once per `chat_loop()` run (not per
-message) and threaded through `route_and_run() -> provider.invoke(...,
-session_id=...)` unconditionally. Every message in a session shares one
-`session_id`, so history continues even as different messages route to
-different Claude tiers/models — lets `llm-chat` stay a thin router in front
-of real Claude Code functionality (tools, system prompt, CLAUDE.md/hooks)
-instead of reimplementing an interface that mimics it. (Rejected first: a
-bespoke reimplemented chat interface, and a raw PTY takeover injecting
-`/model` mid-session — undocumented, more fragile.)
+message) — originally threaded through `route_and_run() ->
+provider.invoke(..., session_id=...)`, now threaded into
+`terminal.create_session()`/`send_message()` instead. Every message in a
+session shares one `session_id`, so history continues even as different
+messages route to different Claude tiers/models — lets `llm-chat` stay a
+thin router in front of real Claude Code functionality (tools, system
+prompt, CLAUDE.md/hooks) instead of reimplementing an interface that mimics
+it. (Rejected first: a bespoke reimplemented chat interface.)
 
 Confirmed against real `claude` 2.1.220 output (2026-07-26): the *first*
 call per session uses `--session-id "$SID"`; every call after must use
@@ -351,12 +447,16 @@ continuously, the other intercepts between messages. Rebuilding Claude Code's in
 `prompt_toolkit` to bridge that gap trades a one-time engineering cost for permanent maintenance
 burden, since the UI layer diverges every time Anthropic ships a feature there.
 
-**The current answer, as of the same-day "Non-blocking spawn" revision** (see near the top of this
-doc): `llm-chat` classifies and spawns for **every** message again, same as the paragraph after
-this one — what changed is that spawning no longer blocks. `chat_loop()` fires the spawn and
-returns to its own prompt immediately, so you can route another message while an earlier spawned
-session is still open, without the one-spawn-per-run detour in between (see below) ever having been
-the right fix for what was actually broken.
+**The current answer, as of the same-day "Persistent tmux session" revision** (see near the top of
+this doc): `llm-chat` still classifies **every** message independently — that part of this section
+remains non-negotiable and true — but no longer spawns a new terminal/process to deliver each one.
+One tmux-backed session is created per run and every message, including the first, is injected into
+it via `send-keys`. This actually softens the "structurally forecloses interactive UX" framing two
+paragraphs up: `llm-chat` and the attached terminal now cooperatively share one live session rather
+than separate processes racing to own the TTY across spawns — the user can still type directly into
+the attached window between `llm-chat`-driven messages, same session either way. The "Non-blocking
+spawn" and "one spawn per run" paragraphs below describe superseded spawn-per-message mechanics, kept
+for history.
 
 **Superseded same-day, kept for history**: in between the original per-message design and the
 current one, `llm-chat` briefly spawned exactly one terminal per run and then got out of the way
