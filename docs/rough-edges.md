@@ -35,3 +35,25 @@
   and decides.
 - Windows `select()` support is still unverified for the streaming transport.
 - Cross-provider session continuity is deferred (see `llm-chat` docs).
+- `terminal.attach_terminal()`'s macOS path (`open <script>.command`) can
+  lose the race against the spawned window's own interactive shell
+  startup: confirmed live (2026-07-31, first real test of the persistent
+  tmux redesign) — `open` launches Terminal.app, which starts a normal
+  interactive login shell (zsh + oh-my-zsh here) *before* typing the
+  script's path into it as if typed by hand. If that shell's own startup
+  has a pending interactive prompt (oh-my-zsh's periodic "Would you like
+  to update? [Y/n]" hit this time), the injected script path gets
+  consumed by that prompt's read instead of executing, so `tmux attach`
+  never runs and the window just shows a shell error. This is a
+  pre-existing risk in the `open`+`.command` mechanism itself
+  (`_spawn_macos()`'s code is unchanged from before the tmux redesign),
+  not something new the redesign introduced — it just hadn't been
+  triggered live before. **Confirmed NOT to affect the actual session**:
+  `create_session()` and `send_message()` ran and worked correctly despite
+  this (verified via `tmux capture-pane` against the live detached
+  session — a real message got a real response) — only the *viewing*
+  window is at risk, not message delivery. The standard fix (oh-my-zsh's
+  own `DISABLE_UPDATE_PROMPT="true"` in `~/.zshrc`) was offered and
+  declined for now (2026-07-31) — revisit if this bites again, since any
+  interactive shell-startup hook (not just oh-my-zsh's update check) could
+  trigger the same race, not just this specific one.

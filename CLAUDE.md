@@ -79,18 +79,33 @@ end for the prior three revisions; Linux/Windows terminal-spawning remains
 unverified against real installs, same status as this repo's Windows
 `select()` gap — see `docs/rough-edges.md`.
 
-**Not done yet, and the next concrete step**: live-verify the tmux redesign
-(the mocked suite is green but has never proven the real thing works,
-same caveat every prior revision here needed) - `brew install tmux`, run
-`llm-chat`, confirm two same-tier messages land as sequential turns in one
-window and a tier change actually switches the model via `/model` before
-the next message. Also watch for whether `/model` needs a settling beat
-before the next `send-keys` call, and whether `tiers.py`'s model strings
-are accepted as-is by `/model` (only confirmed it takes a direct argument
-at all, via the binary's own usage string, not that it behaves correctly
-under tmux injection). Remaining work beyond that is the pre-existing
-parked threads below (Codex tier calibration, Windows/Linux verification)
-plus whatever surfaces from continued daily use.
+**First live test run (2026-07-31), partial success**: `create_session()`
+and `send_message()` are confirmed working for real — verified via `tmux
+capture-pane` against the live detached session, which showed `claude`
+running in the correct cwd and a real message (`5+55 + 5`) getting a real
+answer (`65`). The core fix (one persistent process, no more `--resume`
+race) is validated. **But `attach_terminal()`'s visible window failed**:
+`open <script>.command` raced against the spawned shell's own oh-my-zsh
+interactive update prompt and lost, so `tmux attach` never ran and the
+window just showed a shell error — a pre-existing risk in the
+unchanged-from-before `open`+`.command` mechanism, not something the tmux
+redesign introduced, that just hadn't been triggered live before. Full
+diagnosis and the (declined-for-now) standard fix in
+`docs/rough-edges.md`.
+
+**Not done yet, and the next concrete step**: re-run the live test once the
+attach-window race isn't in the way (either by getting lucky, by manually
+`tmux attach -t <session_id>`-ing in place of the broken auto-spawn, or by
+revisiting the declined `DISABLE_UPDATE_PROMPT` fix) to actually confirm a
+tier change switches the model via `/model` before the next message lands
+- that part is still unverified. Also still watch for whether `/model`
+needs a settling beat before the next `send-keys` call, and whether
+`tiers.py`'s model strings are accepted as-is by `/model` (only confirmed
+it takes a direct argument at all, via the binary's own usage string, not
+that it behaves correctly under tmux injection). Remaining work beyond
+that is the pre-existing parked threads below (Codex tier calibration,
+Windows/Linux verification) plus whatever surfaces from continued daily
+use.
 
 Separately still true and unaffected by the above: `audit_tier2`/
 `shadow_report` launchd jobs are live on this dev machine
