@@ -231,8 +231,14 @@ content match what was actually decided at the time.
   runs and `llm-chat`; an authenticated `codex` CLI too if you plan to add a
   Codex tier (see "Adding a provider" below) — no tier is calibrated to
   Codex yet, so it isn't required for normal use
-- macOS/Linux for `llm-chat`'s live-streaming output (`repl.py`'s reader uses
-  `select.select()` on pipes, which doesn't work on Windows); the `route`
+- `tmux` on `PATH` — `llm-chat` delivers every message into a persistent
+  `tmux`-backed session (`terminal.py`), checked via `terminal.tmux_available()`
+  before it starts; without it, `llm-chat` refuses to start rather than
+  failing mid-session
+- macOS/Linux for `llm-chat` — `tmux` itself doesn't run natively on
+  Windows (WSL/Cygwin only); `terminal.py` has a `_spawn_windows()` path for
+  the visible-window attach step, but it's best-effort and unverified
+  against a real Windows install (see `docs/rough-edges.md`). The `route`
   CLI itself is platform-independent
 
 ### 2. Install dependencies
@@ -389,14 +395,21 @@ uv run llm-chat
 
 Authenticates each configured provider once at startup (refuses to start if
 Codex is the only authenticated provider, since every tier currently maps to
-Claude — see `CLAUDE.md`), then routes every message you type independently
-through `route_and_run()`, streaming the response live. All messages in one
-session share a `session_id`, so Claude-side history/tools continue across
-turns even as different messages land on different tiers/models. Full tool
-use and your `CLAUDE.md`/hooks run for real (not a stripped eval-harness
-call) at real per-call cost (~$0.07-0.30/call), under
-`--permission-mode bypassPermissions` since there's no TTY for an approval
-prompt in a headless call.
+Claude — see `CLAUDE.md`), then classifies every message you type
+independently via `route()` and delivers it into a single persistent
+`tmux`-backed terminal session (`terminal.py`) running the routed `claude`
+CLI — not a new process per message. The first message creates that session
+and opens a visible terminal window attached to it (`tmux attach`); every
+message after, including a tier change, is injected into the same
+already-running process via `tmux send-keys`, exactly as if typed by hand. A
+tier change mid-conversation sends the provider CLI's own `/model <name>`
+first. All messages in one session share a `session_id`, so Claude-side
+history/tools continue across turns even as different messages land on
+different tiers/models. Full tool use and your `CLAUDE.md`/hooks run for
+real (not a stripped eval-harness call) at real per-call cost
+(~$0.07-0.30/call). See `docs/llm-chat.md` for the full mechanics and known
+limitations (e.g. switching *provider*, not just model, mid-session isn't
+supported).
 
 #### Running `llm-chat` from anywhere (not just inside this repo)
 
@@ -420,15 +433,16 @@ this repo take effect immediately, no reinstall step. Anyone cloning this
 repo runs the same command from repo root to get the same result — no
 machine-specific PATH edit to redo per clone.
 
-**Worth knowing before you do this:** `llm-chat` never sets an explicit
-working directory for its underlying `claude -p` calls, so it inherits
-whatever directory you ran it from — a message you type while `cwd` is some
-other project operates on *that* project's files, not this repo's. And
-because every call already runs under `--permission-mode bypassPermissions`
-(above), there's no one-time "do you trust this folder?" prompt the way
-plain interactive `claude` shows the first time you use it somewhere new —
-tool access is silent and immediate in whatever directory you happen to be
-in when a message routes to a tool-capable tier.
+**Worth knowing before you do this:** `terminal.create_session()` passes
+`os.getcwd()` explicitly as the tmux pane's working directory, so whatever
+directory you ran `llm-chat` from is what the routed `claude` session
+operates on — a message you type while `cwd` is some other project operates
+on *that* project's files, not this repo's. Unlike the old direct `claude
+-p` calls, the tmux session runs `claude` with a real interactive pty and no
+`--permission-mode` override, so it behaves exactly like running `claude`
+yourself: the normal "do you trust this folder?" prompt shows the first time
+you use it somewhere new, and tool-use approval prompts apply as usual
+inside that session.
 
 ### Auditing tier 2 and shadow-eval divergence
 

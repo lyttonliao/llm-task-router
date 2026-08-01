@@ -33,7 +33,17 @@
   what the drift/shadow reports find — scheduling only automates the
   *running* of those reports, not the judgment; a human still reads the log
   and decides.
-- Windows `select()` support is still unverified for the streaming transport.
+- Windows `select()` support is still unverified for the streaming transport
+  (`claude_cli.py`'s `_drain()`, still exercised by `cli.py`'s one-shot
+  `route_and_run()` path; `chat_loop()` no longer calls it at all as of the
+  tmux redesign).
+- `terminal.py`'s Linux (`_spawn_linux()`) and Windows (`_spawn_windows()`)
+  paths for `attach_terminal()`'s visible-window step are both best-effort,
+  unverified against real installs — only the macOS path
+  (`_spawn_macos()`) has been exercised live. Separately, `tmux` itself has
+  no native Windows build (WSL/Cygwin only), so `llm-chat` on Windows needs
+  one of those even before `_spawn_windows()`'s own correctness is in
+  question.
 - Cross-provider session continuity is deferred (see `llm-chat` docs).
 - `terminal.attach_terminal()`'s macOS path (`open <script>.command`) can
   lose the race against the spawned window's own interactive shell
