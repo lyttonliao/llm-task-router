@@ -1,12 +1,15 @@
-import os
 import shlex
 from unittest.mock import Mock, patch
 
 import pytest
 
 from llm_task_router.terminal import (
+    attach_terminal,
+    create_session,
     provider_cli_name,
-    spawn_provider_session,
+    send_message,
+    switch_model,
+    tmux_available,
 )
 
 # --- provider_cli_name ---
@@ -20,6 +23,95 @@ def test_provider_cli_name_known_providers():
 def test_provider_cli_name_unknown_raises():
     with pytest.raises(ValueError, match="unknown provider"):
         provider_cli_name("gemini")
+
+
+# --- tmux_available ---
+
+
+@patch("llm_task_router.terminal.shutil.which", return_value="/opt/homebrew/bin/tmux")
+def test_tmux_available_true_when_on_path(mock_which):
+    assert tmux_available() is True
+    mock_which.assert_called_once_with("tmux")
+
+
+@patch("llm_task_router.terminal.shutil.which", return_value=None)
+def test_tmux_available_false_when_missing(mock_which):
+    assert tmux_available() is False
+
+
+# --- create_session ---
+
+
+@patch("llm_task_router.terminal.subprocess.run")
+def test_create_session_builds_detached_new_session_command(mock_run):
+    create_session("claude", "sonnet", "sid-123", "/repo/dir")
+
+    cmd = mock_run.call_args.args[0]
+    assert cmd == [
+        "tmux", "new-session", "-d", "-s", "sid-123", "-c", "/repo/dir",
+        "--", "claude", "--model", "sonnet", "--session-id", "sid-123",
+    ]
+    assert mock_run.call_args.kwargs.get("check") is True
+
+
+@patch("llm_task_router.terminal.subprocess.run")
+def test_create_session_uses_provider_cli_name(mock_run):
+    create_session("codex", "gpt-5.5", "sid-456", "/repo/dir")
+
+    cmd = mock_run.call_args.args[0]
+    assert cmd[cmd.index("--") + 1] == "codex"
+
+
+@patch("llm_task_router.terminal.subprocess.run")
+def test_create_session_unknown_provider_raises_before_running_anything(mock_run):
+    with pytest.raises(ValueError, match="unknown provider"):
+        create_session("gemini", "some-model", "sid-123", "/repo/dir")
+    mock_run.assert_not_called()
+
+
+# --- send_message ---
+
+
+@patch("llm_task_router.terminal.subprocess.run")
+def test_send_message_sends_literal_text_then_enter_as_two_calls(mock_run):
+    send_message("sid-123", "hello world")
+
+    assert mock_run.call_count == 2
+    literal_call, enter_call = mock_run.call_args_list
+    assert literal_call.args[0] == ["tmux", "send-keys", "-t", "sid-123", "-l", "--", "hello world"]
+    assert enter_call.args[0] == ["tmux", "send-keys", "-t", "sid-123", "Enter"]
+
+
+@patch("llm_task_router.terminal.subprocess.run")
+def test_send_message_literal_call_happens_before_enter_call(mock_run):
+    send_message("sid-123", "hi")
+
+    assert mock_run.call_args_list[0].args[0][-1] == "hi"
+    assert mock_run.call_args_list[1].args[0][-1] == "Enter"
+
+
+@patch("llm_task_router.terminal.subprocess.run")
+def test_send_message_does_not_reinterpret_special_characters(mock_run):
+    """The whole point of -l plus the -- separator: a message that looks
+    like tmux key syntax (semicolons, a leading '-') must still be sent as
+    plain literal text, not parsed as flags or multiple commands."""
+    send_message("sid-123", "-rf; C-c looks scary")
+
+    literal_call = mock_run.call_args_list[0]
+    assert literal_call.args[0] == ["tmux", "send-keys", "-t", "sid-123", "-l", "--", "-rf; C-c looks scary"]
+
+
+# --- switch_model ---
+
+
+@patch("llm_task_router.terminal.subprocess.run")
+def test_switch_model_sends_model_slash_command_via_send_message(mock_run):
+    switch_model("sid-123", "opus")
+
+    literal_call = mock_run.call_args_list[0]
+    assert literal_call.args[0] == ["tmux", "send-keys", "-t", "sid-123", "-l", "--", "/model opus"]
+    enter_call = mock_run.call_args_list[1]
+    assert enter_call.args[0] == ["tmux", "send-keys", "-t", "sid-123", "Enter"]
 
 
 # --- helpers ---
@@ -39,13 +131,13 @@ def _capture_script_side_effect(captured: dict, script_arg_index: int):
     return _side_effect
 
 
-# --- spawn_provider_session: command construction + macOS dispatch ---
+# --- attach_terminal: command construction + macOS dispatch ---
 
 
 @patch("llm_task_router.terminal.platform.system", return_value="Darwin")
 @patch("llm_task_router.terminal.subprocess.run")
-def test_spawn_macos_uses_open_with_command_script(mock_run, mock_system):
-    result = spawn_provider_session("claude", "sonnet", "sid-123", "hello world")
+def test_attach_macos_uses_open_with_command_script(mock_run, mock_system):
+    result = attach_terminal("sid-123", "/repo/dir")
 
     assert result is None  # non-blocking: nothing to report back
     launch_cmd = mock_run.call_args.args[0]
@@ -55,57 +147,35 @@ def test_spawn_macos_uses_open_with_command_script(mock_run, mock_system):
 
 @patch("llm_task_router.terminal.platform.system", return_value="Darwin")
 @patch("llm_task_router.terminal.subprocess.run")
-def test_spawn_macos_script_contains_session_id_flag(mock_run, mock_system):
+def test_attach_macos_script_runs_tmux_attach(mock_run, mock_system):
     captured = {}
     mock_run.side_effect = _capture_script_side_effect(captured, script_arg_index=1)
 
-    spawn_provider_session("claude", "sonnet", "sid-123", "hello world", resume=False)
+    attach_terminal("sid-123", "/repo/dir")
 
-    assert "claude --model sonnet --session-id sid-123" in captured["script"]
-    assert "hello world" in captured["script"]
+    assert "tmux attach -t sid-123" in captured["script"]
 
 
 @patch("llm_task_router.terminal.platform.system", return_value="Darwin")
 @patch("llm_task_router.terminal.subprocess.run")
-def test_spawn_macos_script_cds_into_callers_cwd(mock_run, mock_system):
-    """Regression test: the first real macOS run (2026-07-31) launched
-    claude in the user's home directory instead of the repo llm-chat was
-    started from, since a freshly opened Terminal window doesn't inherit
-    this process's cwd on its own - the wrapper script must cd there
-    explicitly."""
+def test_attach_macos_script_cds_into_callers_cwd(mock_run, mock_system):
     captured = {}
     mock_run.side_effect = _capture_script_side_effect(captured, script_arg_index=1)
 
-    spawn_provider_session("claude", "sonnet", "sid-123", "hi")
+    attach_terminal("sid-123", "/repo/dir")
 
     lines = captured["script"].splitlines()
-    assert lines[1] == f"cd -- {shlex.quote(os.getcwd())}"
-    # the cd must run before the actual provider command
-    assert lines.index(lines[1]) < next(i for i, line in enumerate(lines) if line.startswith("claude "))
+    assert lines[1] == f"cd -- {shlex.quote('/repo/dir')}"
+    assert lines.index(lines[1]) < next(i for i, line in enumerate(lines) if line.startswith("tmux "))
 
 
 @patch("llm_task_router.terminal.platform.system", return_value="Darwin")
 @patch("llm_task_router.terminal.subprocess.run")
-def test_spawn_macos_resume_uses_resume_flag(mock_run, mock_system):
+def test_attach_macos_script_deletes_itself_as_last_line(mock_run, mock_system):
     captured = {}
     mock_run.side_effect = _capture_script_side_effect(captured, script_arg_index=1)
 
-    spawn_provider_session("claude", "sonnet", "sid-123", "hi", resume=True)
-
-    assert "--resume sid-123" in captured["script"]
-    assert "--session-id" not in captured["script"]
-
-
-@patch("llm_task_router.terminal.platform.system", return_value="Darwin")
-@patch("llm_task_router.terminal.subprocess.run")
-def test_spawn_macos_script_deletes_itself_as_last_line(mock_run, mock_system):
-    """Non-blocking means this module never learns when the spawned
-    process finishes, so it can't safely delete the wrapper script itself
-    after launching - the script must clean up after its own run instead."""
-    captured = {}
-    mock_run.side_effect = _capture_script_side_effect(captured, script_arg_index=1)
-
-    spawn_provider_session("claude", "sonnet", "sid-123", "hi")
+    attach_terminal("sid-123", "/repo/dir")
 
     script_path = mock_run.call_args.args[0][1]
     lines = captured["script"].splitlines()
@@ -114,15 +184,10 @@ def test_spawn_macos_script_deletes_itself_as_last_line(mock_run, mock_system):
 
 @patch("llm_task_router.terminal.platform.system", return_value="Darwin")
 @patch("llm_task_router.terminal.subprocess.run")
-def test_spawn_macos_does_not_wait_for_subprocess_run_to_report_completion(mock_run, mock_system):
-    """The whole point of the non-blocking revision: spawn_provider_session
-    must return as soon as the launcher call (`open ...`) itself returns,
-    without any further polling/sleeping - confirmed by never patching in
-    a sentinel file or any completion signal at all and still returning
-    cleanly."""
+def test_attach_macos_does_not_wait_for_subprocess_run_to_report_completion(mock_run, mock_system):
     mock_run.return_value = Mock(returncode=0)
 
-    spawn_provider_session("claude", "sonnet", "sid-123", "hi")  # must not hang
+    attach_terminal("sid-123", "/repo/dir")  # must not hang
 
     mock_run.assert_called_once()
 
@@ -133,10 +198,10 @@ def test_spawn_macos_does_not_wait_for_subprocess_run_to_report_completion(mock_
 @patch("llm_task_router.terminal.platform.system", return_value="Linux")
 @patch("llm_task_router.terminal.shutil.which")
 @patch("llm_task_router.terminal.subprocess.run")
-def test_spawn_linux_uses_first_available_terminal(mock_run, mock_which, mock_system):
+def test_attach_linux_uses_first_available_terminal(mock_run, mock_which, mock_system):
     mock_which.side_effect = lambda name: "/usr/bin/gnome-terminal" if name == "gnome-terminal" else None
 
-    spawn_provider_session("claude", "sonnet", "sid-123", "hi")
+    attach_terminal("sid-123", "/repo/dir")
 
     launch_cmd = mock_run.call_args.args[0]
     assert launch_cmd[0] == "gnome-terminal"
@@ -145,9 +210,9 @@ def test_spawn_linux_uses_first_available_terminal(mock_run, mock_which, mock_sy
 
 @patch("llm_task_router.terminal.platform.system", return_value="Linux")
 @patch("llm_task_router.terminal.shutil.which", return_value=None)
-def test_spawn_linux_raises_when_no_terminal_found(mock_which, mock_system):
+def test_attach_linux_raises_when_no_terminal_found(mock_which, mock_system):
     with pytest.raises(RuntimeError, match="no supported terminal emulator"):
-        spawn_provider_session("claude", "sonnet", "sid-123", "hi")
+        attach_terminal("sid-123", "/repo/dir")
 
 
 # --- Windows dispatch ---
@@ -155,8 +220,8 @@ def test_spawn_linux_raises_when_no_terminal_found(mock_which, mock_system):
 
 @patch("llm_task_router.terminal.platform.system", return_value="Windows")
 @patch("llm_task_router.terminal.subprocess.run")
-def test_spawn_windows_uses_cmd_start(mock_run, mock_system):
-    spawn_provider_session("claude", "sonnet", "sid-123", "hi")
+def test_attach_windows_uses_cmd_start(mock_run, mock_system):
+    attach_terminal("sid-123", "/repo/dir")
 
     launch_cmd = mock_run.call_args.args[0]
     assert launch_cmd[:3] == ["cmd", "/c", "start"]
@@ -164,7 +229,7 @@ def test_spawn_windows_uses_cmd_start(mock_run, mock_system):
 
 @patch("llm_task_router.terminal.platform.system", return_value="Windows")
 @patch("llm_task_router.terminal.subprocess.run")
-def test_spawn_windows_script_cds_into_callers_cwd(mock_run, mock_system):
+def test_attach_windows_script_cds_into_callers_cwd(mock_run, mock_system):
     captured = {}
 
     def _side_effect(cmd, *args, **kwargs):
@@ -175,15 +240,15 @@ def test_spawn_windows_script_cds_into_callers_cwd(mock_run, mock_system):
 
     mock_run.side_effect = _side_effect
 
-    spawn_provider_session("claude", "sonnet", "sid-123", "hi")
+    attach_terminal("sid-123", "/repo/dir")
 
-    assert f'cd /d "{os.getcwd()}"' in captured["script"]
+    assert 'cd /d "/repo/dir"' in captured["script"]
 
 
 # --- Unsupported platform ---
 
 
 @patch("llm_task_router.terminal.platform.system", return_value="Plan9")
-def test_spawn_unsupported_platform_raises(mock_system):
+def test_attach_unsupported_platform_raises(mock_system):
     with pytest.raises(ValueError, match="unsupported platform"):
-        spawn_provider_session("claude", "sonnet", "sid-123", "hi")
+        attach_terminal("sid-123", "/repo/dir")

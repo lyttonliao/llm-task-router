@@ -1,32 +1,35 @@
 """Interactive terminal chat client, strictly a routing layer: authenticates
 once per provider at startup (offering to run each provider's own login
 command interactively), then for every message classifies via
-router.route() and spawns a real native terminal (terminal.py) running the
-routed claude/codex CLI call - the spawned session is what actually shows
-the response and handles all interactive work (tool use, follow-up turns,
-plan mode, etc.), natively, not this module. See CLAUDE.md's "Next step"
-section and docs/llm-chat.md for the full pivot away from rendering
-provider output in-process (the old route_and_run() + tui.StreamRenderer
-streaming path).
+router.route() and delegates to a single persistent tmux-backed terminal
+session (terminal.py) running the routed claude/codex CLI - that session is
+what actually shows the response and handles all interactive work (tool
+use, follow-up turns, plan mode, etc.), natively, not this module. See
+CLAUDE.md's "Next step" section and docs/llm-chat.md for the full pivot
+away from rendering provider output in-process (the old route_and_run() +
+tui.StreamRenderer streaming path).
 
-Non-blocking spawn per message (revised 2026-07-31 twice in one session -
-see docs/llm-chat.md for the full history): terminal.spawn_provider_session()
-launches the terminal and returns immediately, without waiting for that
-session to exit, so chat_loop() returns to its own prompt right away and
-you can route another message while an earlier spawned session is still
-open. An in-between design (spawn once per run, then chat_loop() itself
-returns) was tried and reverted the same day after live use showed the
-earlier *blocking* per-message design was the actual problem, not the
-per-message part - once spawning stopped blocking, going back to a normal
-loop was the right call. session_established tracks whether this run's
-session_id has had its establishing --session-id call yet, mirroring
-providers/claude_cli.py's own _established_sessions - since spawning is
-non-blocking, a message that arrives before an earlier spawn's session has
-actually finished being created is a real, currently-untested
---resume race, accepted deliberately (see terminal.py's own docstring)
-rather than reintroducing blocking to avoid it.
+Persistent tmux session, not spawn-per-message (revised 2026-07-31, fourth
+same-day revision - see docs/llm-chat.md for the full history): earlier
+revisions spawned a brand new terminal window and provider CLI process for
+every message (using --session-id on the first spawn, --resume on every
+spawn after). Live use showed this was the wrong model - a new window per
+message instead of one continuing place, and a real, previously-untested
+--resume race whenever a second message arrived before the first spawn's
+session had actually finished being established. chat_loop() now creates
+the provider CLI session once (terminal.create_session()), attaches ONE
+terminal window to it (terminal.attach_terminal()), and delivers every
+message - the first one included - via terminal.send_message(), which
+injects the text into that same still-running process exactly as a human
+typing would. There is only ever one provider process per run, so the
+--resume race is gone structurally, not just mitigated. active_model
+tracks which model that live session is currently running as; a tier
+change mid-run sends the provider CLI's own /model command
+(terminal.switch_model()) before the next message, rather than starting a
+new process. See terminal.py's own docstring for the tmux mechanics.
 """
 
+import os
 import sys
 import uuid
 
@@ -145,25 +148,22 @@ def format_response(decision, result) -> str:
 
 def chat_loop(*, input_fn=input, print_fn=print) -> None:
     """One session_id, generated once here (not per message), is threaded
-    into every route() call and spawn_provider_session() call - the latter
-    turns that into --session-id on the first spawn and --resume on every
-    spawn after (see session_established below), so conversation history
-    continues in the spawned claude/codex session even as the classifier
-    sends different messages to different tiers. Spawning is non-blocking
-    (see terminal.py's module docstring), so chat_loop() returns to this
-    prompt immediately after each spawn - you can route a new message
-    while an earlier spawned session is still open.
+    into every route() call and into the single tmux session created for
+    this run (see terminal.create_session()). session_created starts False
+    and flips to True right after create_session()+attach_terminal() both
+    succeed - a raise means the session/terminal never actually launched
+    (unknown provider, tmux missing, unsupported platform, no terminal
+    emulator found - see terminal.py), so the next message must retry
+    creation rather than send into a session that doesn't exist.
 
-    session_established starts False and flips to True right after the
-    first spawn call that doesn't raise - a raise means the terminal never
-    actually launched (unknown provider, unsupported platform, no terminal
-    emulator found, the launcher command itself failing - see terminal.py),
-    so the session was never established on that path. Because spawning no
-    longer waits for the launched session to finish being created,
-    --resume-ing session_id on the very next message is a real,
-    currently-untested race if that message arrives before the prior
-    --session-id call has actually finished establishing it - accepted
-    deliberately, see module docstring.
+    active_model tracks which model the live tmux session is currently
+    running as. Every message after the session is created either sends
+    straight through (terminal.send_message()) when the routed model
+    matches active_model, or first sends a /model switch
+    (terminal.switch_model()) when the tier changed - both go through the
+    same synchronous send-keys injection, so there's no spawn/resume race
+    to worry about: chat_loop()'s own while loop already serializes these
+    calls one message at a time.
 
     A boxed input frame (top/bottom border around each prompt) was tried and
     removed the same day: it can't wrap around input that line-wraps in the
@@ -177,7 +177,8 @@ def chat_loop(*, input_fn=input, print_fn=print) -> None:
     the user asked around each "you>" prompt. Skipped for blank input and
     slash commands, which stay tight to the prompt they answer."""
     session_id = str(uuid.uuid4())
-    session_established = False
+    session_created = False
+    active_model = None
     first_turn = True
     while True:
         if not first_turn:
@@ -219,19 +220,34 @@ def chat_loop(*, input_fn=input, print_fn=print) -> None:
         print_fn(tui.header(decision))
 
         try:
-            terminal.spawn_provider_session(
-                decision.provider, decision.model, session_id, line, resume=session_established
-            )
-            session_established = True
+            if not session_created:
+                terminal.create_session(decision.provider, decision.model, session_id, os.getcwd())
+                terminal.attach_terminal(session_id, os.getcwd())
+                session_created = True
+                active_model = decision.model
+            elif decision.model != active_model:
+                terminal.switch_model(session_id, decision.model)
+                active_model = decision.model
+
+            terminal.send_message(session_id, line)
         except Exception as exc:
-            print_fn(f"[internal error] {exc!r} - could not open a terminal for this session, try again")
+            print_fn(f"[internal error] {exc!r} - could not deliver this message, try again")
             continue
 
-        print_fn(f"{tui.style(tui.DIM)}opened in a new terminal{tui.style(tui.RESET)}")
+        print_fn(f"{tui.style(tui.DIM)}sent to session{tui.style(tui.RESET)}")
 
 
 def main() -> None:
     print("llm-chat - interactive router client\n")
+
+    if not terminal.tmux_available():
+        print(
+            "tmux not found on PATH - llm-chat needs it to keep a persistent "
+            "provider session alive across messages (see docs/llm-chat.md). "
+            "Install it (e.g. `brew install tmux`) and try again. Exiting."
+        )
+        sys.exit(1)
+
     authenticated = startup_auth_check()
     if not authenticated:
         print("No providers authenticated. Nothing to route to - exiting.")

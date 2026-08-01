@@ -1,3 +1,4 @@
+import os
 import uuid
 from unittest.mock import Mock, patch
 
@@ -227,12 +228,14 @@ def test_chat_loop_skips_blank_lines_without_routing():
     mock_route.assert_not_called()
 
 
-def test_chat_loop_routes_plain_message_and_spawns_a_terminal():
+def test_chat_loop_routes_plain_message_and_creates_session_then_attaches_then_sends():
     decision = RouteDecision(tier="cheap", provider="claude", model="haiku", reason="r")
 
     with (
         patch("llm_task_router.repl.route", return_value=decision) as mock_route,
-        patch("llm_task_router.repl.terminal.spawn_provider_session") as mock_spawn,
+        patch("llm_task_router.repl.terminal.create_session") as mock_create,
+        patch("llm_task_router.repl.terminal.attach_terminal") as mock_attach,
+        patch("llm_task_router.repl.terminal.send_message") as mock_send,
     ):
         chat_loop(input_fn=Mock(side_effect=["fix the bug", "/exit"]), print_fn=lambda *a: None)
 
@@ -243,24 +246,27 @@ def test_chat_loop_routes_plain_message_and_spawns_a_terminal():
     assert request.domain is None
     assert uuid.UUID(request.session_id)  # a real UUID string, not raising
 
-    mock_spawn.assert_called_once_with("claude", "haiku", request.session_id, "fix the bug", resume=False)
+    mock_create.assert_called_once_with("claude", "haiku", request.session_id, os.getcwd())
+    mock_attach.assert_called_once_with(request.session_id, os.getcwd())
+    mock_send.assert_called_once_with(request.session_id, "fix the bug")
 
 
-def test_chat_loop_does_not_block_reading_more_input_after_a_spawn():
-    """Spawning is non-blocking (2026-07-31, second same-day revision -
-    see terminal.py's module docstring for why the earlier blocking design
-    was reverted): chat_loop() must keep prompting for more messages right
-    after a spawn call returns, not wait for or depend on that spawned
-    session ever exiting."""
+def test_chat_loop_does_not_block_reading_more_input_after_attaching():
+    """attach_terminal() is non-blocking: chat_loop() must keep prompting
+    for more messages right after it returns, not wait for or depend on
+    the attached session ever exiting."""
     decision = RouteDecision(tier="cheap", provider="claude", model="haiku", reason="r")
 
     with (
         patch("llm_task_router.repl.route", return_value=decision),
-        patch("llm_task_router.repl.terminal.spawn_provider_session") as mock_spawn,
+        patch("llm_task_router.repl.terminal.create_session"),
+        patch("llm_task_router.repl.terminal.attach_terminal") as mock_attach,
+        patch("llm_task_router.repl.terminal.send_message"),
     ):
         chat_loop(input_fn=Mock(side_effect=["first", "second", "/exit"]), print_fn=lambda *a: None)
 
-    assert mock_spawn.call_count == 2
+    # only the first message creates+attaches the session
+    mock_attach.assert_called_once()
 
 
 def test_chat_loop_reuses_same_session_id_across_messages():
@@ -271,7 +277,9 @@ def test_chat_loop_reuses_same_session_id_across_messages():
 
     with (
         patch("llm_task_router.repl.route", return_value=decision) as mock_route,
-        patch("llm_task_router.repl.terminal.spawn_provider_session"),
+        patch("llm_task_router.repl.terminal.create_session"),
+        patch("llm_task_router.repl.terminal.attach_terminal"),
+        patch("llm_task_router.repl.terminal.send_message"),
     ):
         chat_loop(input_fn=Mock(side_effect=["first", "second", "/exit"]), print_fn=lambda *a: None)
 
@@ -282,38 +290,88 @@ def test_chat_loop_reuses_same_session_id_across_messages():
     assert request_1.session_id == request_2.session_id
 
 
-def test_chat_loop_resume_flag_toggles_after_first_successful_spawn():
-    """The first message must establish the session (resume=False); every
-    message after must resume it (resume=True) - mirrors claude_cli.py's
-    --session-id-first-call/--resume-after distinction, tracked locally
-    in chat_loop()."""
+def test_chat_loop_only_creates_and_attaches_once_across_messages():
+    """The whole point of the persistent-session redesign: create_session()
+    and attach_terminal() must run exactly once per chat_loop() run, no
+    matter how many messages follow - every message after the first is
+    delivered via send_message() into the already-running session."""
     decision = RouteDecision(tier="cheap", provider="claude", model="haiku", reason="r")
 
     with (
         patch("llm_task_router.repl.route", return_value=decision),
-        patch("llm_task_router.repl.terminal.spawn_provider_session") as mock_spawn,
+        patch("llm_task_router.repl.terminal.create_session") as mock_create,
+        patch("llm_task_router.repl.terminal.attach_terminal") as mock_attach,
+        patch("llm_task_router.repl.terminal.send_message") as mock_send,
+    ):
+        chat_loop(input_fn=Mock(side_effect=["first", "second", "third", "/exit"]), print_fn=lambda *a: None)
+
+    mock_create.assert_called_once()
+    mock_attach.assert_called_once()
+    assert mock_send.call_count == 3
+
+
+def test_chat_loop_switches_model_before_sending_when_tier_changes():
+    """A routed model change mid-run must send /model (via switch_model())
+    before the actual message, not spawn a new process."""
+    decisions = [
+        RouteDecision(tier="cheap", provider="claude", model="haiku", reason="r"),
+        RouteDecision(tier="flagship", provider="claude", model="opus", reason="r"),
+    ]
+    events = []
+
+    with (
+        patch("llm_task_router.repl.route", side_effect=decisions),
+        patch("llm_task_router.repl.terminal.create_session"),
+        patch("llm_task_router.repl.terminal.attach_terminal"),
+        patch(
+            "llm_task_router.repl.terminal.switch_model",
+            side_effect=lambda sid, model: events.append(("switch", model)),
+        ),
+        patch(
+            "llm_task_router.repl.terminal.send_message",
+            side_effect=lambda sid, text: events.append(("send", text)),
+        ),
     ):
         chat_loop(input_fn=Mock(side_effect=["first", "second", "/exit"]), print_fn=lambda *a: None)
 
-    assert mock_spawn.call_count == 2
-    assert mock_spawn.call_args_list[0].kwargs["resume"] is False
-    assert mock_spawn.call_args_list[1].kwargs["resume"] is True
+    assert events == [
+        ("send", "first"),
+        ("switch", "opus"),
+        ("send", "second"),
+    ]
 
 
-def test_chat_loop_prints_opened_in_new_terminal_message_after_successful_spawn():
+def test_chat_loop_does_not_switch_model_when_tier_is_unchanged():
+    decision = RouteDecision(tier="cheap", provider="claude", model="haiku", reason="r")
+
+    with (
+        patch("llm_task_router.repl.route", return_value=decision),
+        patch("llm_task_router.repl.terminal.create_session"),
+        patch("llm_task_router.repl.terminal.attach_terminal"),
+        patch("llm_task_router.repl.terminal.switch_model") as mock_switch,
+        patch("llm_task_router.repl.terminal.send_message"),
+    ):
+        chat_loop(input_fn=Mock(side_effect=["first", "second", "/exit"]), print_fn=lambda *a: None)
+
+    mock_switch.assert_not_called()
+
+
+def test_chat_loop_prints_sent_to_session_message_after_successful_send():
     decision = RouteDecision(tier="cheap", provider="claude", model="haiku", reason="r")
     print_fn = Mock()
 
     with (
         patch("llm_task_router.repl.route", return_value=decision),
-        patch("llm_task_router.repl.terminal.spawn_provider_session"),
+        patch("llm_task_router.repl.terminal.create_session"),
+        patch("llm_task_router.repl.terminal.attach_terminal"),
+        patch("llm_task_router.repl.terminal.send_message"),
     ):
         chat_loop(input_fn=Mock(side_effect=["first", "/exit"]), print_fn=print_fn)
 
-    assert any("opened in a new terminal" in str(call) for call in print_fn.call_args_list)
+    assert any("sent to session" in str(call) for call in print_fn.call_args_list)
 
 
-def test_chat_loop_prints_header_before_spawning():
+def test_chat_loop_prints_header_before_creating_session():
     decision = RouteDecision(tier="flagship", provider="claude", model="opus", reason="r")
     events = []
 
@@ -321,15 +379,17 @@ def test_chat_loop_prints_header_before_spawning():
     with (
         patch("llm_task_router.repl.route", return_value=decision),
         patch(
-            "llm_task_router.repl.terminal.spawn_provider_session",
-            side_effect=lambda *a, **k: events.append(("spawn", a)),
+            "llm_task_router.repl.terminal.create_session",
+            side_effect=lambda *a, **k: events.append(("create", a)),
         ),
+        patch("llm_task_router.repl.terminal.attach_terminal"),
+        patch("llm_task_router.repl.terminal.send_message"),
     ):
         chat_loop(input_fn=Mock(side_effect=["fix the bug", "/exit"]), print_fn=print_fn)
 
     header_index = next(i for i, (kind, payload) in enumerate(events) if kind == "print" and "claude/opus" in payload)
-    spawn_index = next(i for i, (kind, _) in enumerate(events) if kind == "spawn")
-    assert header_index < spawn_index
+    create_index = next(i for i, (kind, _) in enumerate(events) if kind == "create")
+    assert header_index < create_index
     assert "flagship" in events[header_index][1]
 
 
@@ -346,46 +406,48 @@ def test_chat_loop_survives_unexpected_exception_from_route():
     print_fn = Mock()
     with (
         patch("llm_task_router.repl.route", side_effect=ValueError("boom")) as mock_route,
-        patch("llm_task_router.repl.terminal.spawn_provider_session") as mock_spawn,
+        patch("llm_task_router.repl.terminal.create_session") as mock_create,
     ):
         chat_loop(input_fn=Mock(side_effect=["first", "second", "/exit"]), print_fn=print_fn)
 
     assert mock_route.call_count == 2
     assert any("boom" in str(call) for call in print_fn.call_args_list)
-    mock_spawn.assert_not_called()
+    mock_create.assert_not_called()
 
 
-def test_chat_loop_survives_exception_from_spawn_provider_session():
-    """A spawn failure must not crash the loop, and since the terminal
-    never actually opened, the next message must still try to establish
-    the session (resume=False) rather than resuming one that never
-    started."""
+def test_chat_loop_survives_exception_from_create_session():
+    """A session-creation failure must not crash the loop, and since the
+    session never actually got created, the next message must still try
+    to create it (not skip straight to send_message() against a session
+    that doesn't exist)."""
     decision = RouteDecision(tier="cheap", provider="claude", model="haiku", reason="r")
     print_fn = Mock()
 
     with (
         patch("llm_task_router.repl.route", return_value=decision),
         patch(
-            "llm_task_router.repl.terminal.spawn_provider_session",
+            "llm_task_router.repl.terminal.create_session",
             side_effect=[RuntimeError("no terminal emulator found"), None],
-        ) as mock_spawn,
+        ) as mock_create,
+        patch("llm_task_router.repl.terminal.attach_terminal") as mock_attach,
+        patch("llm_task_router.repl.terminal.send_message") as mock_send,
     ):
         chat_loop(input_fn=Mock(side_effect=["first", "second", "/exit"]), print_fn=print_fn)
 
-    assert mock_spawn.call_count == 2
-    session_id_1 = mock_spawn.call_args_list[0].args[2]
-    session_id_2 = mock_spawn.call_args_list[1].args[2]
+    assert mock_create.call_count == 2
+    session_id_1 = mock_create.call_args_list[0].args[2]
+    session_id_2 = mock_create.call_args_list[1].args[2]
     assert session_id_1 == session_id_2
-    assert mock_spawn.call_args_list[0].kwargs["resume"] is False
-    assert mock_spawn.call_args_list[1].kwargs["resume"] is False
+    # first attempt failed before attach/send ever ran; second succeeded
+    mock_attach.assert_called_once()
+    mock_send.assert_called_once_with(session_id_2, "second")
     assert any("no terminal emulator found" in str(call) for call in print_fn.call_args_list)
 
 
 def test_chat_loop_prints_divider_between_retries_but_not_before_first_prompt():
     """Dividers separate re-prompts on paths that never spawned a terminal
     (here: two unknown commands in a row before /exit) - there's no
-    "between successful turns" case anymore since a successful spawn ends
-    the loop immediately."""
+    "between successful turns" case here since these never route at all."""
     from llm_task_router import tui
 
     print_fn = Mock()
@@ -405,7 +467,9 @@ def test_chat_loop_prints_blank_gap_after_user_line_before_header():
     print_fn = Mock()
     with (
         patch("llm_task_router.repl.route", return_value=decision),
-        patch("llm_task_router.repl.terminal.spawn_provider_session"),
+        patch("llm_task_router.repl.terminal.create_session"),
+        patch("llm_task_router.repl.terminal.attach_terminal"),
+        patch("llm_task_router.repl.terminal.send_message"),
     ):
         chat_loop(input_fn=Mock(side_effect=["fix the bug", "/exit"]), print_fn=print_fn)
 
@@ -417,8 +481,23 @@ def test_chat_loop_prints_blank_gap_after_user_line_before_header():
 # --- main ---
 
 
+def test_main_exits_nonzero_when_tmux_not_available():
+    with (
+        patch("llm_task_router.repl.terminal.tmux_available", return_value=False),
+        patch("llm_task_router.repl.startup_auth_check") as mock_auth_check,
+        patch("llm_task_router.repl.chat_loop") as mock_chat_loop,
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        main()
+
+    assert exc_info.value.code == 1
+    mock_auth_check.assert_not_called()
+    mock_chat_loop.assert_not_called()
+
+
 def test_main_exits_nonzero_when_no_providers_authenticated():
     with (
+        patch("llm_task_router.repl.terminal.tmux_available", return_value=True),
         patch("llm_task_router.repl.startup_auth_check", return_value=set()),
         patch("llm_task_router.repl.chat_loop") as mock_chat_loop,
         pytest.raises(SystemExit) as exc_info,
@@ -431,6 +510,7 @@ def test_main_exits_nonzero_when_no_providers_authenticated():
 
 def test_main_exits_nonzero_when_no_tiers_routable():
     with (
+        patch("llm_task_router.repl.terminal.tmux_available", return_value=True),
         patch("llm_task_router.repl.startup_auth_check", return_value={"codex"}),
         patch("llm_task_router.repl.chat_loop") as mock_chat_loop,
         pytest.raises(SystemExit) as exc_info,
@@ -443,6 +523,7 @@ def test_main_exits_nonzero_when_no_tiers_routable():
 
 def test_main_enters_chat_loop_when_claude_authenticated():
     with (
+        patch("llm_task_router.repl.terminal.tmux_available", return_value=True),
         patch("llm_task_router.repl.startup_auth_check", return_value={"claude"}),
         patch("llm_task_router.repl.chat_loop") as mock_chat_loop,
     ):

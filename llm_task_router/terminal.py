@@ -4,38 +4,56 @@ the user gets full native Claude Code/Codex UX instead of this repo
 re-rendering it - see CLAUDE.md's "Next step" section and the full design at
 ~/.claude/plans/what-s-our-next-goal-jazzy-tome.md (this machine/user's
 plans directory, not in-repo; describes an earlier blocking version of this
-module, since revised - see "Non-blocking" below).
+module, since revised - see docs/llm-chat.md for the full history).
 
-This module is deliberately narrow: it only launches a terminal running the
-provider CLI and returns. It does NOT decide provider/model (router.py
-already does that) and does NOT track which session ids have had their
-establishing --session-id call yet (unlike providers/claude_cli.py's
-_established_sessions - callers own that decision here and pass resume=
-accordingly).
+This module is deliberately narrow: it only launches/drives a terminal
+running the provider CLI and does NOT decide provider/model (router.py
+already does that).
 
-Non-blocking (revised 2026-07-31, after an earlier blocking version):
-spawn_provider_session() launches the terminal and returns as soon as the
-launch itself succeeds, without waiting for the spawned claude/codex
-session to exit. The earlier version blocked on a disposable wrapper-script
-+ sentinel-file poll loop (since `open -a Terminal`/equivalents don't block
-on their own) so repl.py's chat_loop() could return to its own prompt only
-once the spawned session ended - live use surfaced that as real friction
-twice (the terminal appearing to open in the wrong directory looked like a
-hang, and being unable to type into llm-chat until fully exiting the
-spawned session, including once requiring Ctrl-C to escape a stuck wait,
-felt broken even after being confirmed as the intended design). The wrapper
-script this module still writes (needed regardless of blocking, to `cd`
-into the caller's cwd and construct the actual command - see below) now
-deletes itself as its own last action instead of this module waiting to
-know when that's safe to do from the polling loop's completion.
+Persistent tmux session, not spawn-per-message (revised 2026-07-31, fourth
+same-day revision): earlier revisions spawned a brand new terminal window
+and a brand new provider CLI process for EVERY message, using
+`--session-id` on the first spawn and `--resume` on every spawn after so
+each new process reloaded the same session's transcript from disk. Live use
+showed this was the wrong model - it opened a new window per message
+instead of continuing in one place, and because spawning was non-blocking,
+a fast second message could fire its `--resume` call before the first
+spawn's `--session-id` call had actually finished registering the session
+on disk, an accepted-but-untested race that looked exactly like "every
+message starts a new session."
+
+The fix: spawn exactly ONE interactive provider CLI process per
+`repl.chat_loop()` run, keep it alive under `tmux`, and deliver every
+message (including the first) by injecting it into that same live process
+via `tmux send-keys` - the same mechanism as a human typing into the
+attached terminal. There is only ever one provider process, so the
+`--resume` race is structurally gone, not just mitigated. `tmux` (not
+`screen`) was chosen because each pane gets a real pty, so the provider
+CLI's interactive raw-mode TUI behaves exactly as if a human were typing,
+and its scripting interface (`send-keys -l` for literal text, `new-session
+-d` for detached creation) is far less fragile than `screen -X stuff`. This
+is a new external-CLI dependency (like `claude`/`codex` themselves, not a
+new Python package) - `tmux_available()` below lets callers fail clearly at
+startup instead of crashing mid-session.
+
+Three functions replace the old single `spawn_provider_session()`:
+`create_session()` (synchronous, starts the provider CLI detached under
+tmux - no visible window yet), `attach_terminal()` (the ONE external
+terminal spawn per run, non-blocking exactly as before, just running `tmux
+attach` instead of the provider CLI directly), and `send_message()` (used
+for every message after the session exists, and for `/model` switches via
+`switch_model()` - see repl.py's chat_loop for the controller logic that
+decides when each is called).
 
 `cd` into the caller's cwd, added 2026-07-31: `open`/terminal-emulator
 launches start the new window's shell at its own default startup directory
 (the user's home directory on macOS), NOT the calling process's cwd -
 confirmed against a real spawn: the spawned session's own startup banner
 reported "launched claude in your home directory" instead of the repo
-llm-chat was run from. Each wrapper script below `cd`s explicitly before
-running the actual provider command.
+llm-chat was run from. `attach_terminal()`'s wrapper script still `cd`s
+explicitly before running `tmux attach` for this reason (tmux's own
+`new-session -c` handles the provider CLI's own cwd separately, in
+`create_session()`).
 
 Verified: macOS only (this machine's daily dev environment), by direct
 manual testing. NOT verified at all: Linux (gnome-terminal/konsole/xterm
@@ -43,7 +61,14 @@ dispatch is written to the same pattern documented above but never run
 against a real Linux desktop) and Windows (same - untested against a real
 `cmd`/`start` invocation). Both are best-effort, matching this repo's
 existing convention for flagging unverified platform behavior (see
-docs/rough-edges.md's Windows select() note for the streaming transport)."""
+docs/rough-edges.md's Windows select() note for the streaming transport).
+Also NOT verified live yet as of this revision: whether `/model <name>`
+(sent via `switch_model()`) needs a settling beat before the next
+`send-keys` call lands cleanly, and whether tiers.py's stored model
+strings are accepted as-is by `/model` (confirmed only that `/model
+<name>` accepts a direct argument at all, via the installed claude
+binary's own usage string - not confirmed end to end under tmux
+injection)."""
 
 import os
 import platform
@@ -65,26 +90,64 @@ def provider_cli_name(provider: str) -> str:
         raise ValueError(f"unknown provider: {provider!r}") from None
 
 
-def spawn_provider_session(
-    provider: str, model: str, session_id: str, message: str, *, resume: bool = False
-) -> None:
-    """Launches a new native terminal running:
-        <provider cli> --model <model> (--session-id|--resume) <session_id> <message>
-    and returns as soon as that launch succeeds - does NOT wait for the
-    spawned session to exit (see module docstring, "Non-blocking").
+def tmux_available() -> bool:
+    """Preflight check - callers (repl.main()) should check this once at
+    startup and fail clearly rather than let create_session() raise a raw
+    FileNotFoundError mid-session."""
+    return shutil.which("tmux") is not None
 
-    resume mirrors claude_cli.py's --session-id-first-call / --resume-
-    after-that distinction - pass resume=True once the caller knows this
-    session_id has already had its establishing call (that bookkeeping
-    lives with the caller, not this module - see module docstring). Because
-    this is non-blocking, a caller that fires a --resume call before an
-    earlier --session-id call has actually finished being established by
-    the spawned CLI is a real, currently-untested race - accepted
-    deliberately rather than reintroducing blocking to avoid it."""
+
+def create_session(provider: str, model: str, session_id: str, cwd: str) -> None:
+    """Starts the provider CLI interactively under a detached tmux session
+    - a real pty exists (tmux always gives panes one) but no terminal
+    window is visible yet, that's attach_terminal()'s job. Synchronous and
+    local (no external window spawn), so unlike attach_terminal() this is
+    safe to just call and wait for - it returns almost instantly.
+
+    No message is baked into this command - the first message is delivered
+    via send_message() exactly like every message after it, so callers
+    never special-case "the first call" the way the old
+    session_established/resume bookkeeping had to."""
     cli = provider_cli_name(provider)
-    session_flag = "--resume" if resume else "--session-id"
-    cmd = [cli, "--model", model, session_flag, session_id, message]
-    cwd = os.getcwd()
+    subprocess.run(
+        ["tmux", "new-session", "-d", "-s", session_id, "-c", cwd, "--", cli, "--model", model, "--session-id", session_id],
+        check=True,
+    )
+
+
+def send_message(session_id: str, text: str) -> None:
+    """Injects text into the live tmux session's pane exactly as a human
+    typing would - two separate send-keys calls, not one: `-l` sends the
+    text literally with no tmux key-name interpretation (so a message
+    containing e.g. ';' or a 'C-c'-looking substring isn't misread as tmux
+    key syntax), then Enter is sent separately as an actual key. The `--`
+    before the text guards against a message that happens to start with
+    '-' being parsed as a send-keys flag."""
+    subprocess.run(["tmux", "send-keys", "-t", session_id, "-l", "--", text], check=True)
+    subprocess.run(["tmux", "send-keys", "-t", session_id, "Enter"], check=True)
+
+
+def switch_model(session_id: str, model: str) -> None:
+    """Sends the provider CLI's own `/model <name>` slash command through
+    the same send_message() injection primitive - kept as a separate named
+    function since it's conceptually a control command, not a user
+    message, even though the mechanism is identical (mirrors how repl.py
+    already separates "route a message" from "spawn a session" as distinct
+    steps). Confirmed only that `/model <name>` accepts a direct argument
+    (see module docstring) - not yet live-verified end to end under tmux
+    injection."""
+    send_message(session_id, f"/model {model}")
+
+
+def attach_terminal(session_id: str, cwd: str) -> None:
+    """Launches a new native terminal running `tmux attach -t <session_id>`
+    and returns as soon as that launch succeeds - does NOT wait for the
+    attached session to exit (same non-blocking contract the old
+    spawn_provider_session() had). This is the ONE external terminal spawn
+    per repl.chat_loop() run - every message after the first is delivered
+    via send_message()/switch_model() directly, with no further terminal
+    spawning at all."""
+    cmd = ["tmux", "attach", "-t", session_id]
 
     system = platform.system()
     if system == "Darwin":
@@ -100,7 +163,7 @@ def spawn_provider_session(
 def _spawn_macos(cmd: list[str], cwd: str) -> None:
     """Writes a .command file (macOS Terminal's double-click/open
     association for shell scripts) and opens it via `open`. The script
-    deletes itself as its last line, once the provider command has
+    deletes itself as its last line, once the launched command has
     finished - not this function's job, since it doesn't wait around to
     find out when that is."""
     run_id = uuid.uuid4().hex
