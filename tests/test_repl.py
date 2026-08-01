@@ -444,6 +444,49 @@ def test_chat_loop_survives_exception_from_create_session():
     assert any("no terminal emulator found" in str(call) for call in print_fn.call_args_list)
 
 
+def test_chat_loop_survives_exception_from_attach_terminal_without_recreating_session():
+    """Real live failure (2026-07-31): create_session() can succeed while
+    attach_terminal() fails to actually display anything. A retry must not
+    call create_session() again with the same session_id (tmux rejects a
+    duplicate new-session name) - it must fall through to send_message()
+    against the session that already exists."""
+    decision = RouteDecision(tier="cheap", provider="claude", model="haiku", reason="r")
+    print_fn = Mock()
+
+    with (
+        patch("llm_task_router.repl.route", return_value=decision),
+        patch("llm_task_router.repl.terminal.create_session") as mock_create,
+        patch(
+            "llm_task_router.repl.terminal.attach_terminal",
+            side_effect=RuntimeError("no terminal emulator found"),
+        ) as mock_attach,
+        patch("llm_task_router.repl.terminal.send_message") as mock_send,
+    ):
+        chat_loop(input_fn=Mock(side_effect=["first", "second", "/exit"]), print_fn=print_fn)
+
+    mock_create.assert_called_once()  # not retried on the second message
+    mock_attach.assert_called_once()  # not retried either - already "created"
+    mock_send.assert_called_once_with(mock_create.call_args.args[2], "second")
+    assert any("no terminal emulator found" in str(call) for call in print_fn.call_args_list)
+
+
+def test_chat_loop_prints_tmux_session_id_and_manual_attach_fallback():
+    decision = RouteDecision(tier="cheap", provider="claude", model="haiku", reason="r")
+    print_fn = Mock()
+
+    with (
+        patch("llm_task_router.repl.route", return_value=decision) as mock_route,
+        patch("llm_task_router.repl.terminal.create_session"),
+        patch("llm_task_router.repl.terminal.attach_terminal"),
+        patch("llm_task_router.repl.terminal.send_message"),
+    ):
+        chat_loop(input_fn=Mock(side_effect=["first", "/exit"]), print_fn=print_fn)
+
+    (request,), _ = mock_route.call_args
+    printed = [str(c) for c in print_fn.call_args_list]
+    assert any(request.session_id in c and "tmux attach -t" in c for c in printed)
+
+
 def test_chat_loop_prints_divider_between_retries_but_not_before_first_prompt():
     """Dividers separate re-prompts on paths that never spawned a terminal
     (here: two unknown commands in a row before /exit) - there's no

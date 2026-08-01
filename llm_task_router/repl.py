@@ -150,11 +150,16 @@ def chat_loop(*, input_fn=input, print_fn=print) -> None:
     """One session_id, generated once here (not per message), is threaded
     into every route() call and into the single tmux session created for
     this run (see terminal.create_session()). session_created starts False
-    and flips to True right after create_session()+attach_terminal() both
-    succeed - a raise means the session/terminal never actually launched
-    (unknown provider, tmux missing, unsupported platform, no terminal
-    emulator found - see terminal.py), so the next message must retry
-    creation rather than send into a session that doesn't exist.
+    and flips to True right after create_session() itself succeeds - not
+    after attach_terminal() too, deliberately: a real live failure
+    (2026-07-31, see docs/rough-edges.md) showed attach_terminal() can fail
+    to actually display anything (a race against the spawned shell's own
+    interactive startup) while create_session() genuinely succeeded, so a
+    retry must fall through to send_message() rather than attempt a second
+    tmux new-session with a name that already exists (tmux rejects that as
+    a duplicate). Only a create_session() failure itself - unknown
+    provider, tmux missing, unsupported platform - means the session
+    doesn't exist and the next message must retry creation.
 
     active_model tracks which model the live tmux session is currently
     running as. Every message after the session is created either sends
@@ -222,9 +227,18 @@ def chat_loop(*, input_fn=input, print_fn=print) -> None:
         try:
             if not session_created:
                 terminal.create_session(decision.provider, decision.model, session_id, os.getcwd())
-                terminal.attach_terminal(session_id, os.getcwd())
+                # Flip these as soon as create_session() succeeds, not after
+                # attach_terminal() too - a retry after an attach failure
+                # must fall through to send_message() below rather than
+                # attempting a second tmux new-session with the same name
+                # (which tmux rejects as a duplicate).
                 session_created = True
                 active_model = decision.model
+                print_fn(
+                    f"{tui.style(tui.DIM)}tmux session: {session_id} "
+                    f"(if no window opens, attach manually: tmux attach -t {session_id}){tui.style(tui.RESET)}"
+                )
+                terminal.attach_terminal(session_id, os.getcwd())
             elif decision.model != active_model:
                 terminal.switch_model(session_id, decision.model)
                 active_model = decision.model
