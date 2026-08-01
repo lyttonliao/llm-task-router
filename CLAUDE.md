@@ -93,19 +93,32 @@ redesign introduced, that just hadn't been triggered live before. Full
 diagnosis and the (declined-for-now) standard fix in
 `docs/rough-edges.md`.
 
-**Not done yet, and the next concrete step**: re-run the live test once the
-attach-window race isn't in the way (either by getting lucky, by manually
-`tmux attach -t <session_id>`-ing in place of the broken auto-spawn, or by
-revisiting the declined `DISABLE_UPDATE_PROMPT` fix) to actually confirm a
-tier change switches the model via `/model` before the next message lands
-- that part is still unverified. Also still watch for whether `/model`
-needs a settling beat before the next `send-keys` call, and whether
-`tiers.py`'s model strings are accepted as-is by `/model` (only confirmed
-it takes a direct argument at all, via the binary's own usage string, not
-that it behaves correctly under tmux injection). Remaining work beyond
-that is the pre-existing parked threads below (Codex tier calibration,
-Windows/Linux verification) plus whatever surfaces from continued daily
-use.
+**Second live test run (2026-07-31), the actual tier-change path, found and
+fixed a real bug**: a manual tier change (haiku → sonnet) showed the model
+switching correctly but the follow-up question never arriving. Reproduced
+directly against a real `claude` session via `tmux capture-pane` (no need
+to relay through a terminal window - driven straight from this Python
+process): `/model <name>` doesn't switch immediately, it opens a "Switch
+model?" confirmation dialog requiring a second `Enter`. Because option 1
+("Yes, switch") is the default selection, the *next* message's own `Enter`
+keypress happened to confirm that dialog - so the switch always silently
+succeeded - but the real message text landed in the dialog instead of a
+text box and was lost every time. Fixed: `switch_model()` now sends a
+second bare `Enter` (after a `_MODEL_SWITCH_CONFIRM_DELAY_S = 0.5`s pause)
+to accept the dialog before returning. Verified against a real session
+post-fix: switch + the actual question both land correctly. This also
+confirms `tiers.py`'s model strings (`haiku`/`sonnet`/`opus`) are accepted
+as-is by `/model` - no longer an open question.
+
+**Not done yet, and the next concrete step**: still no live confirmation
+that `attach_terminal()`'s visible-window race (previous entry above) is
+actually fixed or just hasn't recurred yet - keep watching for it on future
+runs. The `_MODEL_SWITCH_CONFIRM_DELAY_S` value is a live-confirmed-
+necessary but not stress-tested guess; revisit if a switch is ever again
+observed swallowing the next message (would mean 0.5s isn't enough headroom
+on a slower machine/session). Remaining work beyond that is the
+pre-existing parked threads below (Codex tier calibration, Windows/Linux
+verification) plus whatever surfaces from continued daily use.
 
 Separately still true and unaffected by the above: `audit_tier2`/
 `shadow_report` launchd jobs are live on this dev machine

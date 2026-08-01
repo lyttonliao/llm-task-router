@@ -97,13 +97,24 @@ tied to a different CLI. Moot today since `TIER_MODELS` maps every tier to
 `docs/rough-edges.md`'s Codex-calibration note), but would need solving
 before any Codex tier lands.
 
-**Not yet verified live** (the mocked test suite only verifies command
-construction — see "Testing gotcha" below): whether `/model` needs a
-settling beat before the next `send-keys` call lands cleanly, and whether
-`tiers.py`'s stored model strings are accepted as-is by `/model` (only
-confirmed that `/model <name>` accepts a direct argument at all, not that
-it behaves correctly when driven via `send-keys` rather than a real
-keypress).
+**Live-tested and fixed same-day (2026-07-31): `/model <name>` doesn't
+switch immediately.** First live end-to-end test (real messages, tier
+change mid-run) surfaced this directly: sending `/model sonnet` + `Enter`
+opens a "Switch model?" confirmation dialog ("1. Yes, switch to Sonnet 5 /
+2. No, go back"), not a completed switch. Because option 1 is the default
+selection, the *next* `send_message()` call's `Enter` keypress ends up
+accepting that dialog by coincidence — so the model genuinely does switch
+— but the real message text typed just before it lands in the dialog, not
+a text box, and is silently lost. Confirmed via `tmux capture-pane`
+against a real session before and after the fix. `switch_model()` now
+sends a second bare `Enter` after `/model <name>` (with a
+`_MODEL_SWITCH_CONFIRM_DELAY_S = 0.5`s pause first, a live-confirmed-
+necessary but not stress-tested guess at how long the dialog takes to
+render) to accept the dialog before returning control to the caller.
+Verified against a real session post-fix: model switch + the actual
+question both land correctly. `tiers.py`'s stored model strings (`haiku`/
+`sonnet`/`opus`) are confirmed accepted as-is by `/model` in this same
+test — no longer an open question.
 
 ## Non-blocking spawn, per-message loop restored (2026-07-31, third same-day revision, superseded - see "Persistent tmux session" above)
 

@@ -104,14 +104,42 @@ def test_send_message_does_not_reinterpret_special_characters(mock_run):
 # --- switch_model ---
 
 
+@patch("llm_task_router.terminal.time.sleep")
 @patch("llm_task_router.terminal.subprocess.run")
-def test_switch_model_sends_model_slash_command_via_send_message(mock_run):
+def test_switch_model_sends_model_slash_command_via_send_message(mock_run, mock_sleep):
     switch_model("sid-123", "opus")
 
     literal_call = mock_run.call_args_list[0]
     assert literal_call.args[0] == ["tmux", "send-keys", "-t", "sid-123", "-l", "--", "/model opus"]
     enter_call = mock_run.call_args_list[1]
     assert enter_call.args[0] == ["tmux", "send-keys", "-t", "sid-123", "Enter"]
+
+
+@patch("llm_task_router.terminal.time.sleep")
+@patch("llm_task_router.terminal.subprocess.run")
+def test_switch_model_sends_a_second_enter_to_confirm_the_switch_dialog(mock_run, mock_sleep):
+    """Real live bug (2026-07-31): /model <name> opens a confirmation
+    dialog rather than switching immediately - without this second Enter,
+    the caller's next send_message() call types the real message into that
+    dialog instead of a text box and it's silently lost."""
+    switch_model("sid-123", "opus")
+
+    assert mock_run.call_count == 3
+    confirm_call = mock_run.call_args_list[2]
+    assert confirm_call.args[0] == ["tmux", "send-keys", "-t", "sid-123", "Enter"]
+    mock_sleep.assert_called_once()
+
+
+@patch("llm_task_router.terminal.time.sleep")
+@patch("llm_task_router.terminal.subprocess.run")
+def test_switch_model_waits_before_sending_the_confirmation_enter(mock_run, mock_sleep):
+    events = []
+    mock_run.side_effect = lambda *a, **k: events.append("run")
+    mock_sleep.side_effect = lambda *a, **k: events.append("sleep")
+
+    switch_model("sid-123", "opus")
+
+    assert events == ["run", "run", "sleep", "run"]
 
 
 # --- helpers ---

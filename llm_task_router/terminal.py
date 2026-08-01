@@ -76,11 +76,25 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import time
 import uuid
 
 _PROVIDER_CLI = {"claude": "claude", "codex": "codex"}
 
 _LINUX_TERMINALS = ("gnome-terminal", "konsole", "xterm")
+
+# Confirmed live (2026-07-31) against real claude 2.1.220: `/model <name>`
+# doesn't switch immediately - it opens a "Switch model?" confirmation
+# dialog ("1. Yes, switch ... / 2. No, go back") that needs a SECOND Enter
+# to accept before the pane is a plain text input again. Sending the next
+# message's keystrokes before that second Enter types them into the dialog
+# instead of a text box - they're silently lost, even though the switch
+# itself still goes through (option 1 is the default selection, so a lone
+# Enter accepts it). This delay is a live-confirmed-necessary but
+# not-stress-tested guess at how long the dialog takes to render and accept
+# input - revisit if a switch is ever still observed swallowing the next
+# message.
+_MODEL_SWITCH_CONFIRM_DELAY_S = 0.5
 
 
 def provider_cli_name(provider: str) -> str:
@@ -129,14 +143,18 @@ def send_message(session_id: str, text: str) -> None:
 
 def switch_model(session_id: str, model: str) -> None:
     """Sends the provider CLI's own `/model <name>` slash command through
-    the same send_message() injection primitive - kept as a separate named
-    function since it's conceptually a control command, not a user
-    message, even though the mechanism is identical (mirrors how repl.py
-    already separates "route a message" from "spawn a session" as distinct
-    steps). Confirmed only that `/model <name>` accepts a direct argument
-    (see module docstring) - not yet live-verified end to end under tmux
-    injection."""
+    the same send_message() injection primitive, then a second bare Enter
+    to accept the confirmation dialog it opens (see
+    _MODEL_SWITCH_CONFIRM_DELAY_S above - confirmed live 2026-07-31: without
+    this second Enter, the switch itself still happens, but the caller's
+    very next send_message() call types the real message into the
+    confirmation dialog instead of a text box and it's silently lost).
+    Kept as a separate named function from send_message() since it's
+    conceptually a control command, not a user message, even though the
+    text-injection mechanism is shared."""
     send_message(session_id, f"/model {model}")
+    time.sleep(_MODEL_SWITCH_CONFIRM_DELAY_S)
+    subprocess.run(["tmux", "send-keys", "-t", session_id, "Enter"], check=True)
 
 
 def attach_terminal(session_id: str, cwd: str) -> None:
