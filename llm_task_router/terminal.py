@@ -130,14 +130,34 @@ def create_session(provider: str, model: str, session_id: str, cwd: str) -> None
 
 
 def send_message(session_id: str, text: str) -> None:
-    """Injects text into the live tmux session's pane exactly as a human
-    typing would - two separate send-keys calls, not one: `-l` sends the
-    text literally with no tmux key-name interpretation (so a message
-    containing e.g. ';' or a 'C-c'-looking substring isn't misread as tmux
-    key syntax), then Enter is sent separately as an actual key. The `--`
-    before the text guards against a message that happens to start with
-    '-' being parsed as a send-keys flag."""
-    subprocess.run(["tmux", "send-keys", "-t", session_id, "-l", "--", text], check=True)
+    """Delivers text into the live tmux session's pane as a real tmux
+    *paste* (load-buffer + paste-buffer -p), not `send-keys -l` (used by
+    every earlier revision of this function) - deliberately changed
+    2026-08-01 after a live gap surfaced: repl.py's input side moved to
+    prompt_toolkit so a multi-line/pasted message no longer auto-submits
+    line-by-line INTO llm-chat's own prompt, but `send-keys -l` sends raw
+    literal bytes with no paste framing at all - any embedded '\\n' in
+    `text` would still have hit the provider CLI's own pty as a bare
+    linefeed, which its line editor (the same class of tool as
+    prompt_toolkit) reads as a real Enter keypress, reintroducing the
+    identical auto-submit bug one hop downstream, per-line inside the
+    remote session instead of locally. `paste-buffer -p` fixes this at the
+    transport: it wraps the buffer in the bracketed-paste escape sequences
+    (ESC[200~ ... ESC[201~) that tell the receiving app "this is a paste,
+    not typing" - but only actually emits them if that app has itself
+    requested bracketed paste mode; confirmed live against a plain `cat`
+    target (which never requests it) that the wrapping is silently skipped
+    there while the literal bytes/newlines still land correctly, so this
+    is safe to use unconditionally regardless of what's listening on the
+    other end. `-d` deletes the paste buffer immediately after so buffers
+    don't accumulate over a long-running session. Loading via stdin
+    (`load-buffer -`) rather than a temp file/CLI arg sidesteps shell
+    quoting entirely - text is opaque bytes to tmux either way, so a
+    message that happens to contain '-' or ';' or a 'C-c'-looking
+    substring is never at risk of being read as tmux flag/key syntax, the
+    same guarantee `-l --` used to provide."""
+    subprocess.run(["tmux", "load-buffer", "-"], input=text.encode(), check=True)
+    subprocess.run(["tmux", "paste-buffer", "-p", "-d", "-t", session_id], check=True)
     subprocess.run(["tmux", "send-keys", "-t", session_id, "Enter"], check=True)
 
 

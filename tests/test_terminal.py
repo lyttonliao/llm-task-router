@@ -73,32 +73,50 @@ def test_create_session_unknown_provider_raises_before_running_anything(mock_run
 
 
 @patch("llm_task_router.terminal.subprocess.run")
-def test_send_message_sends_literal_text_then_enter_as_two_calls(mock_run):
+def test_send_message_loads_pastes_then_sends_enter_as_three_calls(mock_run):
     send_message("sid-123", "hello world")
 
-    assert mock_run.call_count == 2
-    literal_call, enter_call = mock_run.call_args_list
-    assert literal_call.args[0] == ["tmux", "send-keys", "-t", "sid-123", "-l", "--", "hello world"]
+    assert mock_run.call_count == 3
+    load_call, paste_call, enter_call = mock_run.call_args_list
+    assert load_call.args[0] == ["tmux", "load-buffer", "-"]
+    assert load_call.kwargs.get("input") == b"hello world"
+    assert paste_call.args[0] == ["tmux", "paste-buffer", "-p", "-d", "-t", "sid-123"]
     assert enter_call.args[0] == ["tmux", "send-keys", "-t", "sid-123", "Enter"]
 
 
 @patch("llm_task_router.terminal.subprocess.run")
-def test_send_message_literal_call_happens_before_enter_call(mock_run):
+def test_send_message_load_call_happens_before_paste_and_enter_calls(mock_run):
     send_message("sid-123", "hi")
 
-    assert mock_run.call_args_list[0].args[0][-1] == "hi"
-    assert mock_run.call_args_list[1].args[0][-1] == "Enter"
+    assert mock_run.call_args_list[0].args[0][:2] == ["tmux", "load-buffer"]
+    assert mock_run.call_args_list[1].args[0][:2] == ["tmux", "paste-buffer"]
+    assert mock_run.call_args_list[2].args[0][-1] == "Enter"
 
 
 @patch("llm_task_router.terminal.subprocess.run")
 def test_send_message_does_not_reinterpret_special_characters(mock_run):
-    """The whole point of -l plus the -- separator: a message that looks
-    like tmux key syntax (semicolons, a leading '-') must still be sent as
-    plain literal text, not parsed as flags or multiple commands."""
+    """load-buffer reads text from stdin as opaque bytes, so a message that
+    looks like tmux key syntax (semicolons, a leading '-', a 'C-c'-looking
+    substring) is never at risk of being parsed as flags or key names - the
+    same guarantee `-l --` used to provide for send-keys."""
     send_message("sid-123", "-rf; C-c looks scary")
 
-    literal_call = mock_run.call_args_list[0]
-    assert literal_call.args[0] == ["tmux", "send-keys", "-t", "sid-123", "-l", "--", "-rf; C-c looks scary"]
+    load_call = mock_run.call_args_list[0]
+    assert load_call.args[0] == ["tmux", "load-buffer", "-"]
+    assert load_call.kwargs.get("input") == b"-rf; C-c looks scary"
+
+
+@patch("llm_task_router.terminal.subprocess.run")
+def test_send_message_preserves_embedded_newlines_as_a_single_paste(mock_run):
+    """The whole point of routing through paste-buffer -p instead of
+    send-keys -l: a multi-line message (pasted content, or typed via
+    llm-chat's Alt+Enter) must land as one paste, not per-line Enter
+    presses in the remote provider CLI - see terminal.py's send_message()
+    docstring for the live gap this closes."""
+    send_message("sid-123", "line one\nline two\nline three")
+
+    load_call = mock_run.call_args_list[0]
+    assert load_call.kwargs.get("input") == b"line one\nline two\nline three"
 
 
 # --- switch_model ---
@@ -109,9 +127,12 @@ def test_send_message_does_not_reinterpret_special_characters(mock_run):
 def test_switch_model_sends_model_slash_command_via_send_message(mock_run, mock_sleep):
     switch_model("sid-123", "opus")
 
-    literal_call = mock_run.call_args_list[0]
-    assert literal_call.args[0] == ["tmux", "send-keys", "-t", "sid-123", "-l", "--", "/model opus"]
-    enter_call = mock_run.call_args_list[1]
+    load_call = mock_run.call_args_list[0]
+    assert load_call.args[0] == ["tmux", "load-buffer", "-"]
+    assert load_call.kwargs.get("input") == b"/model opus"
+    paste_call = mock_run.call_args_list[1]
+    assert paste_call.args[0] == ["tmux", "paste-buffer", "-p", "-d", "-t", "sid-123"]
+    enter_call = mock_run.call_args_list[2]
     assert enter_call.args[0] == ["tmux", "send-keys", "-t", "sid-123", "Enter"]
 
 
@@ -124,8 +145,8 @@ def test_switch_model_sends_a_second_enter_to_confirm_the_switch_dialog(mock_run
     dialog instead of a text box and it's silently lost."""
     switch_model("sid-123", "opus")
 
-    assert mock_run.call_count == 3
-    confirm_call = mock_run.call_args_list[2]
+    assert mock_run.call_count == 4
+    confirm_call = mock_run.call_args_list[3]
     assert confirm_call.args[0] == ["tmux", "send-keys", "-t", "sid-123", "Enter"]
     mock_sleep.assert_called_once()
 
@@ -139,7 +160,7 @@ def test_switch_model_waits_before_sending_the_confirmation_enter(mock_run, mock
 
     switch_model("sid-123", "opus")
 
-    assert events == ["run", "run", "sleep", "run"]
+    assert events == ["run", "run", "run", "sleep", "run"]
 
 
 # --- helpers ---

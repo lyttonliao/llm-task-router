@@ -16,6 +16,68 @@ that session exits. Built so engineers without an API budget get a
 live-routing chat experience off existing Claude/ChatGPT subscriptions;
 no code path touches `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`.
 
+## Paste-safe multi-line input (2026-08-01)
+
+**The problem, found by actually pasting into `llm-chat`**: `repl.py`'s
+prompt used bare `input()`, which hands line editing straight to the
+terminal's own readline layer with no real paste awareness — pasting
+multi-line text (resume bullets, a code block) submitted each line the
+instant its embedded `\n` hit stdin, instead of landing as one message the
+user could review/add context to before sending. This is the same root
+limitation the "static input-box frame" attempt below already ran into,
+just surfacing through a different symptom.
+
+**Fix, local side**: `repl.py` now builds its `input_fn` via
+`build_input_fn()`, backed by `prompt_toolkit.PromptSession` instead of
+`input()`. `PromptSession` auto-negotiates bracketed paste on any
+vt100-compatible terminal — pasted text (even multi-line) lands as one
+literal buffer edit, not per-line Enter presses — and picks up real
+arrow-key/Home/End line editing plus session-scoped history (up/down
+recalls this run's earlier messages, `InMemoryHistory`, no persistence
+across runs). A `Meta+Enter` (`escape`, `enter`) key binding inserts a
+literal newline for deliberately composing a multi-line message by hand
+(e.g. adding context above/below pasted content) — plain `Enter` still
+submits, matching prior behavior for the common single-line case.
+`tui.prompt()`'s raw ANSI escape codes are wrapped in `ANSI(...)` so
+prompt_toolkit renders them instead of treating the escape bytes as
+literal characters (it manages the terminal's screen buffer itself, unlike
+`input()` writing straight through). New runtime dependency — the first
+addition to `pyproject.toml` outside the tier-2 classifier's already-
+discussed exception (`sentence-transformers`/`psycopg`), justified the
+same way: multi-line paste-safe editing isn't something worth
+hand-rolling raw `termios`/`tty` for, which was already declined once (see
+"Known limitations" below).
+
+**Fix, remote side — the less obvious half**: fixing only the local prompt
+would have moved the exact same bug one hop downstream. `terminal.py`'s
+`send_message()` used to inject text via `tmux send-keys -l` — literal
+bytes with no paste framing at all. A multi-line message that now survives
+intact locally would still hit the provider CLI's own pty as bare `\n`
+bytes, which its line editor reads as real Enter keypresses, splitting the
+message into separate submits inside the *remote* session instead of
+`llm-chat`'s own prompt. Fixed by switching `send_message()` to tmux's
+real paste primitive: `tmux load-buffer -` (reads text from stdin, so
+messages containing `-`/`;`/`C-c`-looking substrings stay safe without
+needing `-l --`'s guard) followed by `tmux paste-buffer -p -d -t
+<session>` — `-p` wraps the buffer in bracketed-paste escape codes
+(`ESC[200~`/`ESC[201~`), but tmux only actually emits them if the pane's
+application has itself requested bracketed paste mode; confirmed live
+against a plain `cat` target (which never requests it) that the wrapping
+is silently skipped there while the literal newlines still land correctly
+— safe to use unconditionally regardless of what's listening on the other
+end. `-d` deletes the buffer immediately after so buffers don't
+accumulate over a long session. A separate `tmux send-keys ... Enter`
+still follows, unchanged, to submit.
+
+**Live-verified end to end (2026-08-01)**, following this repo's standing
+rule that `terminal.py`'s mocked tests only prove command construction,
+never real behavior: a real detached session running `claude --model
+haiku` was sent `"Compute the following two numbers summed together on
+the next line:\n40000 + 2222"` via the new `send_message()`. `tmux
+capture-pane` showed both lines under a single `❯` prompt and one correct
+answer (`42222`) — confirming the message landed as one paste, not two
+separate submits, exactly the failure mode this fix targets.
+
 ## Persistent tmux session, not spawn-per-message (2026-07-31, fourth same-day revision)
 
 **Supersedes "Non-blocking spawn" below**, which itself superseded "One
@@ -387,7 +449,13 @@ hands line editing to the terminal's own readline layer, which
 overwrites/advances at the cursor — no way to keep a border in place once
 text wraps. Doing it properly needs raw terminal mode (`termios`/`tty`) with
 a hand-rolled line editor — declined twice as a much bigger build than
-everything else in this pass. Back to a plain `tui.prompt()`.
+everything else in this pass. Back to a plain `tui.prompt()`. **Partly
+superseded 2026-08-01**: the underlying `input()` line-editing gap (no real
+paste awareness, no arrow-key editing) is now fixed by moving to
+`prompt_toolkit` — see "Paste-safe multi-line input" above — but the
+boxed-frame *visual* idea specifically is still not attempted; the two are
+separable and only the editing-capability half was ever the blocker for
+paste/arrow-key support.
 
 **Plan mode (`/plan <description>`), implemented 2026-07-31, removed the
 same day by the spawn-per-message pivot (see "Spawn-per-message pivot"

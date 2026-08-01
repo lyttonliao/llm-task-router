@@ -565,6 +565,11 @@ def test_main_exits_nonzero_when_no_tiers_routable():
 
 
 def test_main_enters_chat_loop_when_claude_authenticated():
+    """chat_loop() is called with an explicit input_fn - build_input_fn()'s
+    prompt_toolkit-backed callable, not the bare-input() default - so main()
+    is asserted against by call count/kwarg presence rather than a fixed
+    input_fn identity (constructing a real PromptSession per call is what
+    build_input_fn() is for)."""
     with (
         patch("llm_task_router.repl.terminal.tmux_available", return_value=True),
         patch("llm_task_router.repl.startup_auth_check", return_value={"claude"}),
@@ -572,4 +577,5 @@ def test_main_enters_chat_loop_when_claude_authenticated():
     ):
         main()
 
-    mock_chat_loop.assert_called_once_with()
+    mock_chat_loop.assert_called_once()
+    assert callable(mock_chat_loop.call_args.kwargs.get("input_fn"))

@@ -33,11 +33,59 @@ import os
 import sys
 import uuid
 
+from prompt_toolkit import PromptSession
+from prompt_toolkit.formatted_text import ANSI
+from prompt_toolkit.history import InMemoryHistory
+from prompt_toolkit.key_binding import KeyBindings
+
 from llm_task_router import terminal, tui
 from llm_task_router.known_models import known_models_for
 from llm_task_router.router import PROVIDERS, route
 from llm_task_router.schema import TaskRequest
 from llm_task_router.tiers import TIER_MODELS
+
+_MULTILINE_KEY_BINDINGS = KeyBindings()
+
+
+@_MULTILINE_KEY_BINDINGS.add("escape", "enter")
+def _insert_newline(event) -> None:
+    """Alt+Enter (Meta+Enter) inserts a literal newline instead of
+    submitting - the deliberate-multiline complement to bracketed paste
+    below: paste never needs this (pasted text lands as literal buffer
+    content on its own), this is for typing/adding a second line by hand,
+    e.g. appending context above or below pasted text before sending."""
+    event.current_buffer.insert_text("\n")
+
+
+def build_input_fn():
+    """Returns an input_fn (str -> str, same call contract as builtin
+    input()) backed by prompt_toolkit instead of readline. Fixes three
+    real UX gaps in plain input(), all coming from the same root cause -
+    input() has no real line editor, just raw readline passthrough over
+    the terminal's own pty: (1) pasted text containing newlines used to
+    submit each line separately the moment the first embedded '\\n' hit
+    the pty, since a paste is indistinguishable from fast typing without a
+    real line editor - prompt_toolkit's bracketed-paste support (automatic
+    on any vt100-compatible terminal, no config needed here) inserts a
+    paste as one literal buffer edit instead, so multi-line pasted content
+    (e.g. resume bullets, code) lands intact and only sends on a real
+    Enter keypress; (2) arrow-key/Home/End/Ctrl-A-style in-line editing now
+    works properly instead of however the raw terminal happens to handle
+    escape sequences; (3) up/down now recalls this run's previous messages
+    via InMemoryHistory (session-scoped only, by design - no persistence
+    across llm-chat runs needed for this).
+
+    tui.prompt() returns raw ANSI escape codes for the "you>" label -
+    wrapped in ANSI() so prompt_toolkit parses/renders those codes instead
+    of treating them as literal printable characters (its own screen
+    buffer manages the terminal, unlike input() which just writes straight
+    through)."""
+    session = PromptSession(history=InMemoryHistory(), key_bindings=_MULTILINE_KEY_BINDINGS)
+
+    def input_fn(prompt_text: str = "") -> str:
+        return session.prompt(ANSI(prompt_text))
+
+    return input_fn
 
 
 def check_provider_auth(name: str, module) -> tuple[bool, str]:
@@ -276,7 +324,7 @@ def main() -> None:
         )
         sys.exit(1)
 
-    chat_loop()
+    chat_loop(input_fn=build_input_fn())
 
 
 if __name__ == "__main__":

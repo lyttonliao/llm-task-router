@@ -248,7 +248,9 @@ uv sync --group dev
 ```
 
 This pulls in `psycopg[binary]`, `pgvector`, and `sentence-transformers` —
-real runtime dependencies of the tier-2 classifier, not optional extras.
+real runtime dependencies of the tier-2 classifier, not optional extras —
+plus `prompt-toolkit`, a real runtime dependency of `llm-chat`'s input
+prompt (paste-safe multi-line editing; see "Interactive chat" below).
 
 ### 3. Create the database and apply the schema
 
@@ -400,16 +402,28 @@ independently via `route()` and delivers it into a single persistent
 `tmux`-backed terminal session (`terminal.py`) running the routed `claude`
 CLI — not a new process per message. The first message creates that session
 and opens a visible terminal window attached to it (`tmux attach`); every
-message after, including a tier change, is injected into the same
-already-running process via `tmux send-keys`, exactly as if typed by hand. A
-tier change mid-conversation sends the provider CLI's own `/model <name>`
-first. All messages in one session share a `session_id`, so Claude-side
-history/tools continue across turns even as different messages land on
-different tiers/models. Full tool use and your `CLAUDE.md`/hooks run for
-real (not a stripped eval-harness call) at real per-call cost
-(~$0.07-0.30/call). See `docs/llm-chat.md` for the full mechanics and known
-limitations (e.g. switching *provider*, not just model, mid-session isn't
-supported).
+message after, including a tier change, is delivered into the same
+already-running process as a real tmux paste (`tmux load-buffer` +
+`paste-buffer -p`, not `send-keys -l`), exactly as if pasted by hand — this
+keeps a multi-line message as one submit inside the remote session instead
+of splitting on embedded newlines. A tier change mid-conversation sends the
+provider CLI's own `/model <name>` first. All messages in one session share
+a `session_id`, so Claude-side history/tools continue across turns even as
+different messages land on different tiers/models. Full tool use and your
+`CLAUDE.md`/hooks run for real (not a stripped eval-harness call) at real
+per-call cost (~$0.07-0.30/call). See `docs/llm-chat.md` for the full
+mechanics and known limitations (e.g. switching *provider*, not just model,
+mid-session isn't supported).
+
+The prompt itself (what you type into, before a message is ever sent to
+`terminal.py`) is a `prompt_toolkit` session, not a bare `input()` call —
+pasting multi-line text (resume bullets, a code block) lands as one literal
+buffer edit instead of submitting line-by-line, arrow keys/Home/End do real
+in-line editing, and up/down recall this run's earlier messages
+(session-scoped only, no history across runs). Plain `Enter` sends the
+message as before; `Alt+Enter` (`Meta+Enter`) inserts a literal newline for
+deliberately composing a multi-line message by hand, e.g. adding context
+above or below pasted content before sending.
 
 #### Running `llm-chat` from anywhere (not just inside this repo)
 

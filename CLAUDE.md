@@ -156,8 +156,10 @@ the referenced doc or plan only if you need the full backstory.
   `llm-eval-harness`. **No longer true repo-wide**: `sentence-transformers`
   and `psycopg`/`pgvector` are real, permanent runtime dependencies of the
   tier-2 classifier (`tier2_classifier.py`/`vector_store.py`/
-  `decision_log.py`) — a deliberate, discussed exception. The rule still
-  holds everywhere else.
+  `decision_log.py`), and `prompt-toolkit` is one for `repl.py`'s input
+  handling (paste-safe multi-line editing, added 2026-08-01 — see
+  docs/llm-chat.md's "Paste-safe multi-line input") — each a deliberate,
+  discussed exception. The rule still holds everywhere else.
 - **Independent from `llm-eval-harness`.** Own dataclasses and provider
   adapters rather than importing the eval harness as a package — the two
   interact conceptually (the harness's benchmark runs calibrate `tiers.py`),
@@ -203,10 +205,17 @@ llm_task_router/
                     each provider at startup, then routes each message
                     independently via route() and delivers it into one
                     persistent tmux-backed terminal session (see
-                    docs/llm-chat.md)
+                    docs/llm-chat.md). Input is read via build_input_fn(),
+                    a prompt_toolkit PromptSession (paste-safe multi-line
+                    editing, arrow keys, session-scoped history - see
+                    docs/llm-chat.md's "Paste-safe multi-line input")
   terminal.py     - platform-dispatch terminal spawn + tmux session
                     control: create_session/attach_terminal/send_message/
-                    switch_model (see docs/llm-chat.md)
+                    switch_model (see docs/llm-chat.md). send_message()
+                    delivers text via tmux load-buffer + paste-buffer -p
+                    (a real tmux paste, bracketed-paste-safe), not
+                    send-keys -l, so a multi-line message can't get split
+                    into separate submits inside the remote provider CLI
   tui.py          - stdlib-only ANSI styling, no longer wired into
                     chat_loop()'s success path (see docs/llm-chat.md)
 ```
