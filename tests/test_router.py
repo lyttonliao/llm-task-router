@@ -41,6 +41,52 @@ def test_route_infers_metadata_when_caller_omits_it():
     assert "type inferred" in decision.reason
 
 
+def test_route_caps_resume_review_at_cheap():
+    """Real-incident regression: routing_decisions ids 73/79/81 - a bare
+    'review my resume' with zero pasted content still inferred task_type
+    code_review (from "review") and landed on code_review x other = M. No
+    new TASK_TYPES member (deliberately kept engineering-only) - instead
+    has_non_engineering_signal() caps bias straight to cheap."""
+    decision = route(TaskRequest(description="okay one last review of my resume"))
+
+    assert decision.tier == "cheap"
+    assert decision.model == "haiku"
+
+
+def test_route_caps_resume_review_at_cheap_even_with_pasted_infra_content():
+    """Real-incident regression: routing_decisions ids 55/63 - pasted resume
+    bullets containing infra/impact vocabulary (kubernetes, production, at
+    scale) below a one-line ask pushed domain to infra and reached flagship.
+    The non-engineering gate fires on the instruction ("review my resume")
+    before the grid/corroboration path ever runs, so the pasted content's
+    vocabulary never gets a chance to matter."""
+    request = TaskRequest(
+        description=(
+            "can you review my resume before I send it\n\n"
+            "Engineered a kubernetes deployment pipeline for production workloads at scale"
+        )
+    )
+    decision = route(request)
+
+    assert decision.tier == "cheap"
+    assert decision.model == "haiku"
+
+
+def test_route_does_not_second_guess_explicit_task_type_on_resume_wording():
+    """The non-engineering gate mirrors the high-stakes gate's convention: a
+    caller-provided task_type is a deliberate override and isn't
+    second-guessed by a keyword check."""
+    request = TaskRequest(
+        description="review my resume",
+        task_type="code_review",
+        domain="other",
+    )
+    decision = route(request)
+
+    assert decision.tier == "mid"
+    assert decision.model == "sonnet"
+
+
 def test_route_caps_inferred_architecture_keywords_at_mid_without_high_stakes_signal():
     """Superseded 2026-07-27 (twice): an *inferred* architecture-shape match
     ("design", "scalable", "fault-tolerant") used to escalate to flagship on

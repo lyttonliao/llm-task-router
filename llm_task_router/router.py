@@ -21,6 +21,7 @@ from llm_task_router.classifier import (
     classify,
     classify_description,
     has_high_stakes_signal,
+    has_non_engineering_signal,
 )
 from llm_task_router.providers import claude_cli, codex_cli
 from llm_task_router.schema import ProviderResult, RouteDecision, TaskRequest
@@ -119,6 +120,16 @@ def _shadow_tier1_only_decision(
             "M",
             TIER_BIAS["M"],
             "shadow (no tier 2): no keyword signal on either axis, hedged to mid",
+        )
+
+    if (
+        has_non_engineering_signal(description)
+        and classification.task_type_source != "provided"
+    ):
+        return (
+            "L",
+            TIER_BIAS["L"],
+            "shadow (no tier 2): non-engineering document review detected - capped at cheap",
         )
 
     grid_bias = classify(classification.task_type, classification.domain)
@@ -238,6 +249,22 @@ def route(request: TaskRequest) -> RouteDecision:
     report_shadow_divergence.py for what this data is for: measuring
     how often and in which direction tier 2 changes the outcome, ahead of
     ever using that to decide whether tier 1 can be deprecated.
+
+    Non-engineering document review gate, added 2026-08-02 after
+    routing_decisions showed 5 real misroutes (ids 55, 63, 73, 79, 81, all
+    resume-review requests, 2 reaching flagship): TASK_TYPES is deliberately
+    engineering-only (see schema.py), so "review my resume" still gets forced
+    into code_review's grid, whose non-frontend cells are M or H. Rather than
+    widen TASK_TYPES to cover non-engineering asks, has_non_engineering_signal()
+    (classifier.py) checks for resume/cover-letter/proofread vocabulary in the
+    instruction (see extract_instruction()) and caps bias straight to L when it
+    fires - task_type/domain still resolve from the grid as always for logging
+    purposes, only the tier is overridden. Same "explicit override isn't
+    second-guessed" convention as the high-stakes corroboration gate above:
+    skipped when the caller explicitly provided task_type. Checked after the
+    no-signal branch (mutually exclusive - a description can't be genuinely
+    signal-free on both axes and also contain a resume/proofread keyword) and
+    before the grid/corroboration path, so it takes priority over both.
     """
     classification = classify_description(
         request.description, request.task_type, request.domain
@@ -283,6 +310,18 @@ def route(request: TaskRequest) -> RouteDecision:
                 "returned an unparseable response, hedged to mid rather than escalating to flagship "
                 "by default (see router.route()'s no-signal fallback note)"
             )
+    elif (
+        has_non_engineering_signal(request.description)
+        and resolved_task_type_source != "provided"
+    ):
+        bias = "L"
+        reason = (
+            f"non-engineering document review detected in the instruction (resume/cover-letter/"
+            f"proofread wording) - capped at cheap regardless of the heuristic grid's "
+            f"{resolved_task_type} x {classification.domain} cell; task_type stays the "
+            "engineering-grid label, only the tier is overridden (see classifier."
+            "has_non_engineering_signal())"
+        )
     else:
         grid_bias = classify(resolved_task_type, classification.domain)
         needs_corroboration = (

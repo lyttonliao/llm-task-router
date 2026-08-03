@@ -103,9 +103,65 @@ IMPACT_KEYWORDS: tuple[str, ...] = (
 )
 
 
+def extract_instruction(description: str) -> str:
+    """The part of `description` that's the actual ask, as opposed to any
+    document/content pasted alongside it - repl.py:260 hands the whole typed
+    or pasted block to `TaskRequest.description` with nothing marking where
+    an instruction ends and attached content begins, so a resume/log/config
+    pasted below a one-line ask was leaking its own vocabulary into
+    TYPE_KEYWORDS/DOMAIN_KEYWORDS/IMPACT_KEYWORDS matching (real incident:
+    routing_decisions ids 55/63 - infra/data vocabulary in pasted resume
+    bullets pushed an inferred domain into an H grid cell, then IMPACT_KEYWORDS
+    matched the same pasted text and corroborated it to flagship, for a
+    request that was just "review my resume").
+
+    Heuristic, not a parser: text up to the first blank line, or the first
+    line if there's no blank line, or the whole string if there's no newline
+    at all - which covers every single-line message (the overwhelming
+    majority of traffic) as a no-op, and matches the actual shape of the two
+    real leak cases above (an instruction sentence, a blank line, then pasted
+    content). Callers needing to check keyword signal should match against
+    this, not the raw description."""
+    normalized = description.strip()
+    blank_line_split = normalized.split("\n\n", 1)
+    if len(blank_line_split) > 1:
+        return blank_line_split[0].strip()
+    return normalized.split("\n", 1)[0].strip()
+
+
+# Signals that a request is really about editing/polishing an existing
+# personal document (a resume, cover letter) rather than doing engineering
+# work - added 2026-08-02 after routing_decisions showed 5 real misroutes
+# (ids 55, 63, 73, 79, 81) for resume-review requests, 2 of them reaching
+# flagship. TASK_TYPES stays engineering-only on purpose (see schema.py) -
+# this is not a task type, it's a bias override: task_type/domain still
+# resolve from the heuristic grid as usual, this only caps the final bias,
+# the same way IMPACT_KEYWORDS/has_high_stakes_signal() adjusts bias without
+# touching task_type/domain. Deliberately narrow and sized to the real data
+# above, not a guess - widen against real misroutes, same discipline
+# IMPACT_KEYWORDS documents.
+NON_ENGINEERING_KEYWORDS: tuple[str, ...] = (
+    "resume",
+    "cover letter",
+    "cover-letter",
+    "cv",
+    "proofread",
+    "copyedit",
+    "copy edit",
+    "wording",
+    "phrasing",
+    "grammar",
+)
+
+
 def has_high_stakes_signal(description: str) -> bool:
-    normalized = description.lower()
+    normalized = extract_instruction(description).lower()
     return any(keyword in normalized for keyword in IMPACT_KEYWORDS)
+
+
+def has_non_engineering_signal(description: str) -> bool:
+    normalized = extract_instruction(description).lower()
+    return any(keyword in normalized for keyword in NON_ENGINEERING_KEYWORDS)
 
 
 def classify(task_type: str, domain: str) -> str:
@@ -136,8 +192,9 @@ def classify_description(
     an expensive false escalation is preferable to silently underrouting an
     ambiguous task. Domain uncertainty is represented as ``other``.
     """
-    inferred_type = _infer_from_keywords(description, TYPE_KEYWORDS)
-    inferred_domain = _infer_from_keywords(description, DOMAIN_KEYWORDS)
+    instruction = extract_instruction(description)
+    inferred_type = _infer_from_keywords(instruction, TYPE_KEYWORDS)
+    inferred_domain = _infer_from_keywords(instruction, DOMAIN_KEYWORDS)
     return TaskClassification(
         task_type=task_type if task_type is not None else inferred_type or "architecture",
         domain=domain if domain is not None else inferred_domain or "other",

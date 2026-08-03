@@ -1,6 +1,13 @@
 import pytest
 
-from llm_task_router.classifier import TYPE_DOMAIN_GRID, classify, classify_description, has_high_stakes_signal
+from llm_task_router.classifier import (
+    TYPE_DOMAIN_GRID,
+    classify,
+    classify_description,
+    extract_instruction,
+    has_high_stakes_signal,
+    has_non_engineering_signal,
+)
 from llm_task_router.schema import DOMAINS, TASK_TYPES
 
 
@@ -76,3 +83,54 @@ def test_classify_description_honors_caller_overrides():
     assert classification.domain == "data"
     assert classification.task_type_source == "provided"
     assert classification.domain_source == "provided"
+
+
+def test_extract_instruction_splits_on_blank_line():
+    description = "review this before I ship it\n\nkubernetes production ETL pipeline bullet points"
+    assert extract_instruction(description) == "review this before I ship it"
+
+
+def test_extract_instruction_splits_on_single_newline_without_blank_line():
+    description = "review this\nkubernetes production ETL pipeline bullet points"
+    assert extract_instruction(description) == "review this"
+
+
+def test_extract_instruction_passthrough_for_single_line():
+    description = "okay one last review of my resume"
+    assert extract_instruction(description) == description
+
+
+def test_has_non_engineering_signal_true_for_resume_and_proofread_wording():
+    assert has_non_engineering_signal("okay one last review of my resume")
+    assert has_non_engineering_signal("can you proofread my cover letter")
+    assert has_non_engineering_signal("check the wording and grammar in this")
+
+
+def test_has_non_engineering_signal_false_for_genuine_code_review():
+    assert not has_non_engineering_signal("review this pull request for the auth service")
+
+
+def test_pasted_content_does_not_leak_domain_or_high_stakes():
+    """Real-incident regression (routing_decisions ids 55/63): pasting resume
+    bullets containing infra/impact vocabulary below a one-line ask must not
+    push domain into infra/data or trip the high-stakes gate - only the
+    instruction line should be scanned for keyword signal."""
+    description = (
+        "can you review this before I send it\n\n"
+        "Engineered a kubernetes deployment pipeline for production workloads at scale"
+    )
+    classification = classify_description(description)
+
+    assert classification.domain == "other"
+    assert not has_high_stakes_signal(description)
+
+
+def test_legitimate_single_line_domain_and_impact_signal_still_fires():
+    """The fix scopes matching to the instruction, not to a shorter string -
+    a single-line message with real domain/impact vocabulary must classify
+    and escalate exactly as before."""
+    description = "design the kubernetes rollout for production"
+    classification = classify_description(description)
+
+    assert classification.domain == "infra"
+    assert has_high_stakes_signal(description)
